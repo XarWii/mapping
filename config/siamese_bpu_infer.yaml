@@ -1,0 +1,182 @@
+# Configuration for launch/siamese_bpu_infer.launch.
+
+siamese_bpu_infer_node:
+  input_topic: "/livox/lidar"
+  bpu_model_path: "/home/sunrise/catkin_ws/siamese_pointnet_explore/runs/real_siamese_v3/hb_mapper_output/real_v3_cached_template_matcher.bin"
+  frame_id: "livox_frame"
+  reflectivity_threshold: 250
+  min_distance_m: 0.1
+  max_distance_m: 30.0
+  cluster_tolerance_m: 0.15
+  min_cluster_points: 3
+  max_cluster_points: 2000
+  max_accumulation_frames: 20
+  publish_interval_sec: 0.1
+  publish_markers: true
+  roi_radius_m: 0.45
+
+target_manager_node:
+  bpu_scores_topic: "/siamese_bpu_infer_node/bpu_scores"
+  cluster_cloud_topic: "/siamese_bpu_infer_node/latest_cluster_cloud"
+  validation_result_topic: "/siamese_bpu_infer_node/validation_result"
+  ekf_status_topic: "/ekf_pose_node/ekf_status"
+  target_command_topic: "/target_manager/target_command"
+  tracking_lost_topic: "/target_manager/tracking_lost"
+  recognition_command_topic: "/target_manager/recognition_command"
+  colored_cloud_topic: "/target_manager/colored_high_points"
+  validation_request_topic: "/siamese_bpu_infer_node/validation_request"
+  frame_id: "livox_frame"
+
+  track_match_distance_m: 0.5
+  association_margin_m: 0.08
+  track_timeout_sec: 2.0
+  max_tracks: 12
+  history_size: 40
+
+  init_required_frames: 5
+  init_score_threshold: 0.3825
+  init_margin_threshold: 0.2
+
+  audit_interval_sec: 5.0
+  audit_required_frames: 3
+  audit_fail_windows: 2
+  audit_score_threshold: 0.30
+  audit_margin_threshold: 0.05
+
+  switch_required_frames: 10
+  switch_score_threshold: 0.42
+  switch_margin_threshold: 0.20
+  switch_min_distance_m: 0.25
+  reinit_distance_m: 0.60
+
+  current_bad_frames: 3
+  current_bad_score_threshold: 0.25
+  current_bad_margin_threshold: 0.10
+  confirm_timeout_sec: 8.0
+  active_correction_min_interval_sec: 0.25
+  active_correction_score_threshold: 0.30
+  active_correction_margin_threshold: -0.20
+
+  search_accumulation_frames: 20
+  search_publish_interval_sec: 0.10
+  tracking_accumulation_frames: 10
+  tracking_publish_interval_sec: 0.15
+  confirm_accumulation_frames: 30
+  confirm_publish_interval_sec: 0.08
+
+  target_cluster_match_distance_m: 0.50
+  use_traditional_validation: false
+  validation_timeout_sec: 4.0
+  validation_accumulation_sec: 2.0
+  validation_roi_radius_m: 0.50
+
+ekf_pose_node:
+  input_topic: "/livox/lidar"
+  frame_id: "livox_frame"
+  reflectivity_threshold: 250
+  min_distance_m: 0.1
+  max_distance_m: 30.0
+  max_normal_distance_m: 8.0
+  quality_min_points: 3
+  quality_good_points: 14
+  normal_quality_good_points: 80
+
+  window_sec: 0.35
+  center_min_points: 5
+  min_normal_points: 8
+  min_window_points: 30
+  max_window_points: 5000
+  max_plane_rms_m: 0.05
+  outlier_sigma: 3.0
+  min_normal_eigen_ratio: 2.0
+  robust_center_trim_ratio: 0.0
+  center_fallback_min_points: 5
+
+  initial_velocity_std_mps: 0.05
+  process_acceleration_std_mps2: 0.35
+  process_normal_std: 0.04
+  position_std_min_m: 0.06
+  position_std_max_m: 0.18
+  normal_std_min: 0.04
+  normal_std_max: 0.35
+  adaptive_process_noise: true
+  position_nis_threshold: 7.815
+  maneuver_boost_max: 5.0
+  maneuver_boost_decay: 0.85
+  lost_timeout_sec: 1.2
+
+  spatial_gate_m: 0.75
+  require_target_command_updates: true
+  target_command_timeout_sec: 0.6
+  target_command_gate_m: 0.50
+  target_command_topic: "/target_manager/target_command"
+  ekf_status_topic: "/ekf_pose_node/ekf_status"
+  wait_for_target_command: true
+
+  publish_debug_clouds: true
+  publish_raw_measurement: true
+  publish_quality: true
+  use_window_normal: true
+  use_frame_normal_fallback: false
+  verbose: false
+
+traditional_validator:
+  input_topic: "/livox/lidar"
+  frame_id: "livox_frame"
+  task1:
+    validation_request_topic: "/siamese_bpu_infer_node/validation_request"
+    validation_result_topic: "/siamese_bpu_infer_node/validation_result"
+    reflectivity_threshold: 250
+    min_distance_m: 0.1
+    max_distance_m: 30.0
+    validation_accumulation_sec: 2.0
+    validation_timeout_sec: 4.0
+    validation_confirm_score_threshold: 0.76
+    validation_confirm_margin_threshold: 0.30
+    template_path: "/home/sunrise/catkin_ws/src/livox_reflective_marker/config/target_board_template.yaml"
+    template_grid_cols: 48
+    template_grid_rows: 48
+    template_mid_grid_cols: 32
+    template_mid_grid_rows: 32
+    template_coarse_grid_cols: 24
+    template_coarse_grid_rows: 24
+    min_template_points: 20
+    target_template_match_points: 120
+    far_template_match_points: 30
+    far_template_distance_m: 8.0
+    min_template_score: 0.22
+    far_min_template_score: 0.22
+    good_template_score: 0.50
+    template_plane_tolerance_m: 0.045
+    confirm_score_threshold: 0.75
+    confirm_margin_threshold: 0.30
+
+resource_monitor_driver:
+  target_node_name: "livox_lidar_publisher2"
+  publish_rate_hz: 2.0
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0
+
+resource_monitor_bpu:
+  target_node_name: "siamese_bpu_infer_node"
+  publish_rate_hz: 2.0
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0
+
+resource_monitor_target_manager:
+  target_node_name: "target_manager_node"
+  publish_rate_hz: 2.0
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0
+
+resource_monitor_traditional_validator:
+  target_node_name: "traditional_validator"
+  publish_rate_hz: 2.0
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0
+
+resource_monitor_ekf:
+  target_node_name: "ekf_pose_node"
+  publish_rate_hz: 2.0
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0

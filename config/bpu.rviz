@@ -109,7 +109,7 @@ Visualization Manager:
       Size (Pixels): 3
       Size (m): 0.10000000149011612
       Style: Flat Squares
-      Topic: /siamese_bpu_infer_node/colored_high_points
+      Topic: /target_manager/colored_high_points
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true

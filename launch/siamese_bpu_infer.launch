@@ -1,30 +1,15 @@
 <?xml version="1.0"?>
 <launch>
+  <arg name="config_file"
+       default="$(find livox_reflective_marker)/config/siamese_bpu_infer.yaml"/>
   <arg name="start_driver" default="true"/>
   <arg name="driver_launch_prefix" default=""/>
   <arg name="driver_output" default="log"/>
-  <arg name="rviz" default="true"/>
-  <arg name="input_topic" default="/livox/lidar"/>
-  <arg name="bpu_model_path"
-       default="/home/sunrise/catkin_ws/siamese_pointnet_explore/runs/real_siamese_v3/hb_mapper_output/real_v3_cached_template_matcher.bin"/>
-  <arg name="score_threshold" default="0.3825"/>
-  <arg name="min_accumulated_points" default="60"/>
-  <arg name="max_accumulation_frames" default="20"/>
-  <arg name="confirm_frames" default="5"/>
-  <arg name="lost_frames" default="3"/>
-  <arg name="init_score_margin" default="0.05"/>
-  <arg name="use_traditional_validation" default="false"/>
-  <arg name="validation_accumulation_sec" default="2.0"/>
-  <arg name="validation_timeout_sec" default="4.0"/>
-  <arg name="validation_roi_radius_m" default="0.50"/>
-  <arg name="start_traditional_validator" default="false"/>
   <arg name="start_ekf" default="true"/>
-  <arg name="track_match_distance_m" default="0.5"/>
-  <arg name="publish_interval_sec" default="0.1"/>
-  <arg name="color_by_confirmed_target" default="true"/>
-  <arg name="color_follow_ekf_status" default="true"/>
-  <arg name="confirmed_target_radius_m" default="0.45"/>
-  <arg name="confirmed_target_timeout_sec" default="0.0"/>
+  <arg name="start_traditional_validator" default="false"/>
+  <arg name="rviz" default="true"/>
+
+  <rosparam command="load" file="$(arg config_file)"/>
 
   <group if="$(arg start_driver)">
     <param name="xfer_format" value="1"/>
@@ -38,8 +23,10 @@
     <param name="enable_lidar_bag" type="bool" value="true"/>
     <param name="enable_imu_bag" type="bool" value="true"/>
 
-    <node name="livox_lidar_publisher2" pkg="livox_ros_driver2"
-          type="livox_ros_driver2_node" required="true"
+    <node name="livox_lidar_publisher2"
+          pkg="livox_ros_driver2"
+          type="livox_ros_driver2_node"
+          required="true"
           output="$(arg driver_output)"
           launch-prefix="$(arg driver_launch_prefix)"/>
   </group>
@@ -47,60 +34,33 @@
   <node name="siamese_bpu_infer_node"
         pkg="livox_reflective_marker"
         type="siamese_bpu_infer_node"
-        output="screen" required="true">
-    <param name="bpu_model_path" value="$(arg bpu_model_path)"/>
-    <param name="input_topic" value="$(arg input_topic)"/>
-    <param name="publish_interval_sec" value="$(arg publish_interval_sec)"/>
-    <param name="max_accumulation_frames" value="$(arg max_accumulation_frames)"/>
-    <param name="roi_radius_m" value="0.45"/>
-    <param name="color_by_confirmed_target" value="$(arg color_by_confirmed_target)"/>
-    <param name="color_follow_ekf_status" value="$(arg color_follow_ekf_status)"/>
-    <param name="confirmed_target_radius_m" value="$(arg confirmed_target_radius_m)"/>
-    <param name="confirmed_target_timeout_sec" value="$(arg confirmed_target_timeout_sec)"/>
-    <param name="target_command_topic" value="/target_manager/target_command"/>
-    <param name="tracking_lost_topic" value="/siamese_bpu_infer_node/tracking_lost"/>
-    <param name="ekf_status_topic" value="/ekf_pose_node/ekf_status"/>
-  </node>
+        output="screen"
+        required="true"/>
+
+  <node name="target_manager_node"
+        pkg="livox_reflective_marker"
+        type="target_manager_node"
+        output="screen"
+        required="true"/>
 
   <group if="$(arg start_ekf)">
     <node name="ekf_pose_node"
           pkg="old_pose"
           type="ekf_pose_node"
-          output="screen" required="true">
-      <rosparam command="load" file="$(find old_pose)/config/params.yaml"/>
-      <param name="input_topic" value="$(arg input_topic)"/>
-      <param name="wait_for_target_command" value="true"/>
-    </node>
+          output="screen"
+          required="true"/>
   </group>
 
-  <node name="target_manager_node"
-        pkg="livox_reflective_marker"
-        type="target_manager_node"
-        output="screen" required="true">
-    <param name="score_threshold" value="$(arg score_threshold)"/>
-    <param name="confirm_frames" value="$(arg confirm_frames)"/>
-    <param name="lost_frames" value="$(arg lost_frames)"/>
-    <param name="init_score_margin" value="$(arg init_score_margin)"/>
-    <param name="track_match_distance_m" value="$(arg track_match_distance_m)"/>
-    <param name="use_traditional_validation" value="$(arg use_traditional_validation)"/>
-    <param name="validation_accumulation_sec" value="$(arg validation_accumulation_sec)"/>
-    <param name="validation_timeout_sec" value="$(arg validation_timeout_sec)"/>
-    <param name="validation_roi_radius_m" value="$(arg validation_roi_radius_m)"/>
-  </node>
-
   <node if="$(arg start_traditional_validator)"
+        name="traditional_validator"
         pkg="livox_reflective_marker"
         type="traditional_validator_node"
-        name="traditional_validator"
-        output="screen">
-    <rosparam command="load" file="$(find livox_reflective_marker)/config/params.yaml"/>
-    <param name="input_topic" value="$(arg input_topic)"/>
-    <param name="task1/validation_accumulation_sec" value="$(arg validation_accumulation_sec)"/>
-    <param name="task1/validation_timeout_sec" value="$(arg validation_timeout_sec)"/>
-  </node>
+        output="screen"/>
 
   <node if="$(arg rviz)"
-        pkg="rviz" type="rviz" name="rviz"
+        name="rviz"
+        pkg="rviz"
+        type="rviz"
         args="-d $(find livox_reflective_marker)/config/bpu.rviz">
     <env name="DISABLE_ROS1_EOL_WARNINGS" value="1"/>
   </node>
@@ -110,52 +70,27 @@
         name="resource_monitor_driver"
         pkg="livox_reflective_marker"
         type="resource_monitor_node"
-        output="screen">
-    <param name="target_node_name" value="livox_lidar_publisher2"/>
-    <param name="publish_rate_hz" value="2.0"/>
-    <param name="cpu_target_percent" value="50.0"/>
-    <param name="memory_target_mb" value="50.0"/>
-  </node>
+        output="screen"/>
 
   <node name="resource_monitor_bpu"
         pkg="livox_reflective_marker"
         type="resource_monitor_node"
-        output="screen">
-    <param name="target_node_name" value="siamese_bpu_infer_node"/>
-    <param name="publish_rate_hz" value="2.0"/>
-    <param name="cpu_target_percent" value="50.0"/>
-    <param name="memory_target_mb" value="50.0"/>
-  </node>
+        output="screen"/>
 
   <node name="resource_monitor_target_manager"
         pkg="livox_reflective_marker"
         type="resource_monitor_node"
-        output="screen">
-    <param name="target_node_name" value="target_manager_node"/>
-    <param name="publish_rate_hz" value="2.0"/>
-    <param name="cpu_target_percent" value="50.0"/>
-    <param name="memory_target_mb" value="50.0"/>
-  </node>
+        output="screen"/>
 
   <node if="$(arg start_traditional_validator)"
         name="resource_monitor_traditional_validator"
         pkg="livox_reflective_marker"
         type="resource_monitor_node"
-        output="screen">
-    <param name="target_node_name" value="traditional_validator"/>
-    <param name="publish_rate_hz" value="2.0"/>
-    <param name="cpu_target_percent" value="50.0"/>
-    <param name="memory_target_mb" value="50.0"/>
-  </node>
+        output="screen"/>
 
   <node if="$(arg start_ekf)"
         name="resource_monitor_ekf"
         pkg="livox_reflective_marker"
         type="resource_monitor_node"
-        output="screen">
-    <param name="target_node_name" value="ekf_pose_node"/>
-    <param name="publish_rate_hz" value="2.0"/>
-    <param name="cpu_target_percent" value="50.0"/>
-    <param name="memory_target_mb" value="50.0"/>
-  </node>
+        output="screen"/>
 </launch>

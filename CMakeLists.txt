@@ -30,6 +30,8 @@ add_message_files(
   CandidateValidationResult.msg
   BpuScoreEntry.msg
   BpuScores.msg
+  ClusterCloud.msg
+  RecognitionCommand.msg
   TraditionalScoreEntry.msg
   TraditionalScores.msg
   TargetCommand.msg

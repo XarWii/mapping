@@ -15,12 +15,10 @@
 #include <sensor_msgs/PointField.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
-#include <std_msgs/Empty.h>
-
 #include <livox_reflective_marker/BpuScores.h>
 #include <livox_reflective_marker/BpuScoreEntry.h>
-#include <livox_reflective_marker/EkfStatus.h>
-#include <livox_reflective_marker/TargetCommand.h>
+#include <livox_reflective_marker/ClusterCloud.h>
+#include <livox_reflective_marker/RecognitionCommand.h>
 
 #include <Eigen/Dense>
 
@@ -46,6 +44,7 @@ struct PointXYZI {
 
 struct Cluster {
   std::vector<PointXYZI> points;
+  std::vector<size_t> indices;  // indices into the source point cloud
   Eigen::Vector3f center = Eigen::Vector3f::Zero();
   float score = 0.0f;
   size_t size() const { return points.size(); }
@@ -71,13 +70,6 @@ struct Config {
   std::string frame_id = "livox_frame";
 
   float roi_radius_m = 0.45f;
-  bool color_by_confirmed_target = true;
-  float confirmed_target_radius_m = 0.45f;
-  double confirmed_target_timeout_sec = 0.0;
-  bool color_follow_ekf_status = true;
-  std::string target_command_topic = "/target_manager/target_command";
-  std::string tracking_lost_topic = "/siamese_bpu_infer_node/tracking_lost";
-  std::string ekf_status_topic = "/ekf_pose_node/ekf_status";
 };
 
 // ---------------------------------------------------------------------------
@@ -142,12 +134,13 @@ std::vector<Cluster> EuclideanCluster(const std::vector<PointXYZI>& points,
         (cfg.max_cluster_points == 0 ||
          indices.size() <= cfg.max_cluster_points)) {
       Cluster c;
+      c.indices = std::move(indices);
       c.center = Eigen::Vector3f::Zero();
-      for (auto idx : indices) {
+      for (auto idx : c.indices) {
         c.points.push_back(points[idx]);
         c.center += Eigen::Vector3f(points[idx].x, points[idx].y, points[idx].z);
       }
-      c.center /= static_cast<float>(indices.size());
+      c.center /= static_cast<float>(c.indices.size());
       clusters.push_back(std::move(c));
     }
   }
@@ -178,15 +171,9 @@ class SiameseBpuInferNode {
     initPublishers();
     sub_ = nh_.subscribe(cfg_.input_topic, 4,
                          &SiameseBpuInferNode::pointCloudCallback, this);
-    target_command_sub_ = nh_.subscribe(
-        cfg_.target_command_topic, 4,
-        &SiameseBpuInferNode::targetCommandCallback, this);
-    tracking_lost_sub_ = nh_.subscribe(
-        cfg_.tracking_lost_topic, 4,
-        &SiameseBpuInferNode::trackingLostCallback, this);
-    ekf_status_sub_ = nh_.subscribe(
-        cfg_.ekf_status_topic, 4,
-        &SiameseBpuInferNode::ekfStatusCallback, this);
+    recfg_sub_ = nh_.subscribe(
+        "/target_manager/recognition_command", 4,
+        &SiameseBpuInferNode::recognitionCommandCallback, this);
     ROS_INFO("[siamese_bpu] pure scorer ready | model: %s",
              cfg_.bpu_model_path.c_str());
   }
@@ -216,15 +203,6 @@ class SiameseBpuInferNode {
     LOAD(pnh_, "publish_interval_sec", cfg_.publish_interval_sec);
     LOAD(pnh_, "publish_markers", cfg_.publish_markers);
     LOAD(pnh_, "roi_radius_m", cfg_.roi_radius_m);
-    cfg_.confirmed_target_radius_m = cfg_.roi_radius_m;
-    LOAD(pnh_, "color_by_confirmed_target", cfg_.color_by_confirmed_target);
-    LOAD(pnh_, "confirmed_target_radius_m", cfg_.confirmed_target_radius_m);
-    LOAD(pnh_, "confirmed_target_timeout_sec",
-         cfg_.confirmed_target_timeout_sec);
-    LOAD(pnh_, "color_follow_ekf_status", cfg_.color_follow_ekf_status);
-    LOAD(pnh_, "target_command_topic", cfg_.target_command_topic);
-    LOAD(pnh_, "tracking_lost_topic", cfg_.tracking_lost_topic);
-    LOAD(pnh_, "ekf_status_topic", cfg_.ekf_status_topic);
     pnh_.param<std::string>("frame_id", cfg_.frame_id, cfg_.frame_id);
 
     if (cfg_.bpu_model_path.empty()) {
@@ -247,148 +225,21 @@ class SiameseBpuInferNode {
       marker_pub_ = pnh_.advertise<visualization_msgs::MarkerArray>(
           "candidate_markers", 4, true);
     }
-    colored_cloud_pub_ = pnh_.advertise<sensor_msgs::PointCloud2>(
-        "colored_high_points", 4, true);
+    cluster_cloud_pub_ = pnh_.advertise<livox_reflective_marker::ClusterCloud>(
+        "latest_cluster_cloud", 4);
   }
 
-  // ---- Main callback ---------------------------------------------------
-
-  void publishColoredCloud(
-      const std::vector<PointXYZI>& latest_points,
-      const std::vector<Cluster>& scored_clusters,
-      ros::Time stamp) {
-    if (colored_cloud_pub_.getNumSubscribers() == 0) return;
-
-    const float match_sq = cfg_.cluster_tolerance_m * cfg_.cluster_tolerance_m;
-    const bool use_confirmed_target =
-        cfg_.color_by_confirmed_target && isConfirmedTargetActive(stamp);
-    const float confirmed_target_sq =
-        cfg_.confirmed_target_radius_m * cfg_.confirmed_target_radius_m;
-
-    sensor_msgs::PointCloud2 cloud;
-    cloud.header.stamp = stamp;
-    cloud.header.frame_id = cfg_.frame_id;
-    cloud.height = 1;
-    cloud.is_bigendian = false;
-    cloud.is_dense = true;
-
-    // 4 fields: x, y, z, rgb
-    sensor_msgs::PointField f;
-    f.datatype = sensor_msgs::PointField::FLOAT32;
-    f.count = 1;
-
-    f.name = "x";        f.offset = 0;  cloud.fields.push_back(f);
-    f.name = "y";        f.offset = 4;  cloud.fields.push_back(f);
-    f.name = "z";        f.offset = 8;  cloud.fields.push_back(f);
-    f.name = "rgb";      f.offset = 12; cloud.fields.push_back(f);
-
-    cloud.point_step = 16;
-    cloud.width = static_cast<uint32_t>(latest_points.size());
-    cloud.row_step = cloud.point_step * cloud.width;
-    cloud.data.resize(cloud.row_step);
-
-    float* buf = reinterpret_cast<float*>(cloud.data.data());
-
-    for (size_t i = 0; i < latest_points.size(); ++i) {
-      const auto& pt = latest_points[i];
-      Eigen::Vector3f pos(pt.x, pt.y, pt.z);
-
-      bool is_target = false;
-      if (use_confirmed_target) {
-        is_target = (pos - confirmed_target_center_).squaredNorm() <=
-                    confirmed_target_sq;
-      } else if (!cfg_.color_by_confirmed_target) {
-        // Legacy visualization: green if the point belongs to a high-score BPU
-        // cluster. Confirmed-target coloring leaves everything yellow until a
-        // final target command is received.
-        for (const auto& c : scored_clusters) {
-          if (c.score >= 0.3825f) {
-            float d2 = (pos - c.center).squaredNorm();
-            if (d2 <= match_sq) { is_target = true; break; }
-          }
-        }
-      }
-
-      uint8_t r, g, b;
-      if (is_target) {
-        r = 0;   g = 255; b = 0;    // green
-      } else {
-        r = 255; g = 200; b = 0;    // orange-yellow
-      }
-
-      uint32_t rgb_packed = (static_cast<uint32_t>(r) << 16) |
-                            (static_cast<uint32_t>(g) << 8) |
-                            static_cast<uint32_t>(b);
-      float rgb_float;
-      std::memcpy(&rgb_float, &rgb_packed, sizeof(float));
-
-      buf[i * 4 + 0] = pt.x;
-      buf[i * 4 + 1] = pt.y;
-      buf[i * 4 + 2] = pt.z;
-      buf[i * 4 + 3] = rgb_float;
+  void recognitionCommandCallback(
+      const livox_reflective_marker::RecognitionCommand::ConstPtr& cmd) {
+    if (cmd->max_accumulation_frames > 0) {
+      cfg_.max_accumulation_frames = cmd->max_accumulation_frames;
+      frame_buffer_.clear();
     }
-
-    colored_cloud_pub_.publish(cloud);
-  }
-
-  void targetCommandCallback(
-      const livox_reflective_marker::TargetCommand::ConstPtr& cmd) {
-    confirmed_target_center_ = Eigen::Vector3f(
-        static_cast<float>(cmd->pose.pose.position.x),
-        static_cast<float>(cmd->pose.pose.position.y),
-        static_cast<float>(cmd->pose.pose.position.z));
-    confirmed_target_stamp_ =
-        cmd->header.stamp.isZero() ? ros::Time::now() : cmd->header.stamp;
-    have_confirmed_target_ = true;
-    ROS_INFO("[siamese_bpu] confirmed target coloring center=[%.2f, %.2f, %.2f]",
-             static_cast<double>(confirmed_target_center_.x()),
-             static_cast<double>(confirmed_target_center_.y()),
-             static_cast<double>(confirmed_target_center_.z()));
-  }
-
-  void trackingLostCallback(const std_msgs::Empty::ConstPtr&) {
-    have_confirmed_target_ = false;
-    confirmed_target_stamp_ = ros::Time();
-    confirmed_target_center_ = Eigen::Vector3f::Zero();
-    ROS_WARN("[siamese_bpu] confirmed target coloring cleared: tracking lost");
-  }
-
-  void ekfStatusCallback(
-      const livox_reflective_marker::EkfStatus::ConstPtr& status) {
-    if (!cfg_.color_follow_ekf_status) return;
-
-    if (status->state == 1) {
-      if (have_confirmed_target_) {
-        have_confirmed_target_ = false;
-        confirmed_target_stamp_ = ros::Time();
-        confirmed_target_center_ = Eigen::Vector3f::Zero();
-        ROS_WARN("[siamese_bpu] confirmed target coloring cleared: EKF lost");
-      }
-      return;
+    if (cmd->publish_interval_sec > 0.0) {
+      cfg_.publish_interval_sec = cmd->publish_interval_sec;
     }
-
-    confirmed_target_center_ = Eigen::Vector3f(
-        static_cast<float>(status->current_pose.pose.position.x),
-        static_cast<float>(status->current_pose.pose.position.y),
-        static_cast<float>(status->current_pose.pose.position.z));
-    confirmed_target_stamp_ =
-        status->header.stamp.isZero() ? ros::Time::now() : status->header.stamp;
-    have_confirmed_target_ = true;
-    ROS_INFO_THROTTLE(
-        2.0,
-        "[siamese_bpu] coloring follows EKF center=[%.2f, %.2f, %.2f]",
-        static_cast<double>(confirmed_target_center_.x()),
-        static_cast<double>(confirmed_target_center_.y()),
-        static_cast<double>(confirmed_target_center_.z()));
-  }
-
-  bool isConfirmedTargetActive(const ros::Time& stamp) const {
-    if (!have_confirmed_target_) return false;
-    if (cfg_.confirmed_target_timeout_sec <= 0.0) return true;
-
-    const ros::Time reference = stamp.isZero() ? ros::Time::now() : stamp;
-    const double age = (reference - confirmed_target_stamp_).toSec();
-    return age <= cfg_.confirmed_target_timeout_sec;
+    ROS_INFO("[siamese_bpu] recfg: accum=%d frames  interval=%.2fs",
+             cfg_.max_accumulation_frames, cfg_.publish_interval_sec);
   }
 
   // ---- Main callback ---------------------------------------------------
@@ -408,13 +259,15 @@ class SiameseBpuInferNode {
     frame_buffer_.push_back(std::move(high_pts));
     if (static_cast<int>(frame_buffer_.size()) > cfg_.max_accumulation_frames)
       frame_buffer_.pop_front();
-    window_id_++;
 
     // 3. Throttle
     if (!last_publish_time_.isZero() &&
         (now - last_publish_time_).toSec() < cfg_.publish_interval_sec)
       return;
     last_publish_time_ = now;
+
+    // Bump window id only when we actually publish.
+    window_id_++;
 
     // 4. Flatten
     std::vector<PointXYZI> accumulated;
@@ -436,24 +289,22 @@ class SiameseBpuInferNode {
       }
     }
 
-    // 6. Refresh centres from the latest frame to eliminate lag.
-    std::vector<Eigen::Vector3f> latest_centers;
+    // 6. Cluster the latest frame once; reuse for centre refresh AND cluster-level coloring.
+    std::vector<Cluster> latest_clusters;
     if (!frame_buffer_.empty() && !frame_buffer_.back().empty()) {
-      auto latest_clusters = EuclideanCluster(frame_buffer_.back(), cfg_);
-      for (auto& c : latest_clusters)
-        latest_centers.push_back(c.center);
+      latest_clusters = EuclideanCluster(frame_buffer_.back(), cfg_);
     }
-    if (!latest_centers.empty()) {
+    if (!latest_clusters.empty()) {
       const float match_sq = cfg_.cluster_tolerance_m * cfg_.cluster_tolerance_m;
       for (auto& c : clusters) {
         int best = -1;
         float best_d2 = match_sq;
-        for (size_t j = 0; j < latest_centers.size(); ++j) {
-          float d2 = (c.center - latest_centers[j]).squaredNorm();
+        for (size_t j = 0; j < latest_clusters.size(); ++j) {
+          float d2 = (c.center - latest_clusters[j].center).squaredNorm();
           if (d2 < best_d2) { best_d2 = d2; best = static_cast<int>(j); }
         }
         if (best >= 0)
-          c.center = latest_centers[best];
+          c.center = latest_clusters[best].center;
       }
     }
 
@@ -479,9 +330,71 @@ class SiameseBpuInferNode {
     if (cfg_.publish_markers)
       publishMarkers(clusters, now);
 
-    // 9. Colored point cloud — latest-frame points, green for target / yellow for rest
-    if (!frame_buffer_.empty())
-      publishColoredCloud(frame_buffer_.back(), clusters, now);
+    // 9. Publish latest-frame cluster cloud for target_manager's visualisation.
+    if (!latest_clusters.empty() || !frame_buffer_.empty()) {
+      publishClusterCloud(latest_clusters,
+                          frame_buffer_.empty()
+                              ? std::vector<PointXYZI>()
+                              : frame_buffer_.back(),
+                          now);
+    }
+  }
+
+  void publishClusterCloud(const std::vector<Cluster>& latest_clusters,
+                           const std::vector<PointXYZI>& latest_points,
+                           ros::Time stamp) {
+    if (cluster_cloud_pub_.getNumSubscribers() == 0) return;
+
+    livox_reflective_marker::ClusterCloud msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = cfg_.frame_id;
+    msg.window_id = window_id_;
+
+    // Build a raw xyz PointCloud2 from latest_points
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header = msg.header;
+    cloud.height = 1;
+    cloud.is_bigendian = false;
+    cloud.is_dense = true;
+
+    sensor_msgs::PointField f;
+    f.datatype = sensor_msgs::PointField::FLOAT32;
+    f.count = 1;
+    f.name = "x";  f.offset = 0;  cloud.fields.push_back(f);
+    f.name = "y";  f.offset = 4;  cloud.fields.push_back(f);
+    f.name = "z";  f.offset = 8;  cloud.fields.push_back(f);
+
+    cloud.point_step = 12;
+    cloud.width = static_cast<uint32_t>(latest_points.size());
+    cloud.row_step = cloud.point_step * cloud.width;
+    cloud.data.resize(cloud.row_step);
+
+    float* buf = reinterpret_cast<float*>(cloud.data.data());
+    for (size_t i = 0; i < latest_points.size(); ++i) {
+      buf[i * 3 + 0] = latest_points[i].x;
+      buf[i * 3 + 1] = latest_points[i].y;
+      buf[i * 3 + 2] = latest_points[i].z;
+    }
+    msg.cloud = cloud;
+
+    // per_point_cluster_id: -1 = orphan, 0..N-1 = valid cluster
+    msg.per_point_cluster_id.resize(latest_points.size(), -1);
+    for (size_t ci = 0; ci < latest_clusters.size(); ++ci) {
+      for (size_t idx : latest_clusters[ci].indices) {
+        if (idx < msg.per_point_cluster_id.size())
+          msg.per_point_cluster_id[idx] = static_cast<int32_t>(ci);
+      }
+    }
+
+    // cluster_centers
+    msg.cluster_centers.resize(latest_clusters.size());
+    for (size_t ci = 0; ci < latest_clusters.size(); ++ci) {
+      msg.cluster_centers[ci].x = latest_clusters[ci].center.x();
+      msg.cluster_centers[ci].y = latest_clusters[ci].center.y();
+      msg.cluster_centers[ci].z = latest_clusters[ci].center.z();
+    }
+
+    cluster_cloud_pub_.publish(msg);
   }
 
   void publishMarkers(const std::vector<Cluster>& clusters, ros::Time stamp) {
@@ -529,19 +442,14 @@ class SiameseBpuInferNode {
   siamese_bpu::BpuPreprocessor preproc_;
 
   ros::Subscriber sub_;
-  ros::Subscriber target_command_sub_;
-  ros::Subscriber tracking_lost_sub_;
-  ros::Subscriber ekf_status_sub_;
+  ros::Subscriber recfg_sub_;
   ros::Publisher bpu_scores_pub_;
   ros::Publisher marker_pub_;
-  ros::Publisher colored_cloud_pub_;
+  ros::Publisher cluster_cloud_pub_;
 
   ros::Time last_publish_time_;
   std::deque<std::vector<PointXYZI>> frame_buffer_;
   uint32_t window_id_ = 0;
-  bool have_confirmed_target_ = false;
-  Eigen::Vector3f confirmed_target_center_ = Eigen::Vector3f::Zero();
-  ros::Time confirmed_target_stamp_;
 };
 
 }  // namespace
