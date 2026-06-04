@@ -1,0 +1,169 @@
+# livox_reflective_marker parameters
+# Loaded under the node's private namespace by the launch file.
+
+# Topic produced by livox_ros_driver2 (CustomMsg, has per-point reflectivity).
+# Default driver topic is /livox/lidar (multi_topic=0, xfer_format=1).
+input_topic: "/livox/lidar"
+input_queue_size: 8
+
+# TF frame_id put on every published cloud / marker.
+frame_id: "livox_frame"
+
+# Reflectivity / range filtering for template candidate points.
+reflectivity_threshold: 250
+min_distance_m: 0.1
+max_distance_m: 30.0
+
+# Logging.
+verbose: false
+
+# -----------------------------------------------------------------------
+# Target board identification node
+# reflective_board_identifier_node
+# -----------------------------------------------------------------------
+task1:
+  # Stage 1: globally accumulate high-reflectivity points and discover candidate ROIs.
+  discovery_window_sec: 0.5
+  discovery_cluster_tolerance_m: 0.25
+  min_discovery_cluster_points: 3
+  max_discovery_cluster_points: 2000
+  max_candidates: 6
+  max_discovery_high_points: 5000
+
+  # Stage 2: inside each candidate ROI, accumulate the local point cloud.
+  min_roi_accumulation_sec: 0.5
+  score_update_sec: 0.2
+  max_accumulation_sec: 10.0
+  roi_padding_m: 0.15
+  min_roi_radius_m: 0.30
+  max_roi_radius_m: 0.60
+  max_roi_points_per_candidate: 50000
+  max_high_points_per_candidate: 3000
+
+  # Confirm only when the best template match is good enough and clearly wins.
+  confirm_score_threshold: 0.8
+  confirm_margin_threshold: 0.30
+
+  # ---- Validation-only mode (traditional_validator_node) ----
+  validation_accumulation_sec: 2.0
+  validation_timeout_sec: 4.0
+  validation_confirm_score_threshold: 0.76
+  validation_confirm_margin_threshold: 0.30
+  validation_request_topic: "/siamese_bpu_infer_node/validation_request"
+  validation_result_topic: "/siamese_bpu_infer_node/validation_result"
+
+  # Target-template matching. The launch file fills template_path.
+  template_path: "/home/sunrise/catkin_ws/src/livox_reflective_marker/config/target_board_template.yaml"
+  template_grid_cols: 48
+  template_grid_rows: 48
+  template_mid_grid_cols: 32
+  template_mid_grid_rows: 32
+  template_coarse_grid_cols: 24
+  template_coarse_grid_rows: 24
+  min_template_points: 20
+  target_template_match_points: 120
+  far_template_match_points: 30
+  far_template_distance_m: 8.0
+  min_template_score: 0.22
+  far_min_template_score: 0.22
+  good_template_score: 0.50
+  template_plane_tolerance_m: 0.045
+
+  # Debug / RViz.
+  publish_raw_cloud: true
+  publish_candidate_cloud: true
+  publish_high_reflective_cloud: true
+  publish_template_match_cloud: true
+  publish_markers: true
+  max_raw_cloud_points: 200000
+  record_detection_result: true
+  result_output_dir: "/home/sunrise/catkin_ws/src/livox_reflective_marker/tmp/reflective_board_results"
+  record_candidate_templates_after_confirm: false
+  candidate_template_accumulation_sec: 0.5
+  candidate_template_output_dir: "/home/sunrise/catkin_ws/src/livox_reflective_marker/tmp/candidate_templates"
+  candidate_template_min_points: 0
+  candidate_template_max_saved_points: 5000
+  verbose: false
+
+# -----------------------------------------------------------------------
+# Target reflective board template recorder
+# reflective_board_template_recorder_node
+# -----------------------------------------------------------------------
+template_recorder:
+  output_path: "/tmp/target_board_template.yaml"
+  min_accumulation_sec: 5
+  max_recording_sec: 30.0
+  target_template_points: 300
+  cluster_tolerance_m: 0.35
+  min_cluster_points: 20
+  max_accumulated_points: 20000
+  max_saved_points: 5000
+  auto_shutdown_after_save: false
+
+# -----------------------------------------------------------------------
+# Dataset collector for PointNet candidate samples
+# reflective_board_dataset_collector_node
+# -----------------------------------------------------------------------
+dataset_collector:
+  dataset_root: "/home/sunrise/catkin_ws/dataset"
+  # candidates: save one snapshot of all candidate ROIs for training.
+  # dense_target: save one dense accumulated target-board cloud.
+  collection_mode: "candidates"
+  # "auto" means labels come from label_source. Use "target" or
+  # "interference" only for manual single-class collection.
+  label: "auto"
+  scene_id: "scene"
+  run_id: ""
+  # Default collection uses the front traditional detector's target_pose.
+  # "internal_template" is only a fallback mode.
+  label_source: "external_pose"
+  target_pose_topic: "/reflective_board_identifier_node/target_pose"
+  target_pose_timeout_sec: 1.0
+  auto_label: true
+  save_unconfirmed: false
+  publish_visualization: true
+
+  frame_windows: [1, 2, 3, 5, 10]
+  cluster_tolerance_m: 0.25
+  min_cluster_points: 3
+  max_cluster_points: 5000
+  max_candidates_per_window: 8
+  # 0 means save every candidate used for visualization.
+  max_saved_candidates_per_window: 0
+
+  roi_padding_m: 0.15
+  min_roi_radius_m: 0.30
+  max_roi_radius_m: 0.60
+  max_saved_roi_points: 2048
+  max_saved_high_points: 512
+  dense_accumulation_frames: 50
+  dense_target_roi_radius_m: 0.45
+  # 0 means save every point in the dense cloud.
+  dense_max_saved_roi_points: 0
+  dense_max_saved_high_points: 0
+
+  # Window used for collector-side candidate visualization and the optional
+  # internal_template fallback. In the default external_pose mode, identity
+  # still comes from target_pose_topic.
+  label_window_frames: 0
+  target_center_tolerance_m: 0.20
+  template_path: "/home/sunrise/catkin_ws/src/livox_reflective_marker/config/target_board_template.yaml"
+  # Only used when label_source is "internal_template".
+  confirm_score_threshold: 0.75
+  confirm_margin_threshold: 0.30
+
+  save_every_n_frames: 1
+  save_once: true
+  max_samples_per_session: 0
+  auto_shutdown_after_max_samples: false
+  verbose: false
+
+# -----------------------------------------------------------------------
+# Resource monitor (resource_monitor_node)
+# -----------------------------------------------------------------------
+resource_monitor:
+  target_node_name: "reflective_board_identifier_node"
+  publish_rate_hz: 2.0
+  cpu_smoothing_alpha: 0.5
+  memory_target_mb: 50.0
+  cpu_target_percent: 50.0

@@ -1,0 +1,18 @@
+# Build and generated outputs
+build/
+devel/
+install/
+logs/
+
+# ROS data captures
+*.bag
+*.bag.active
+
+# Python/cache/editor files
+*.pyc
+__pycache__/
+.vscode/
+
+# Local OS/editor noise
+*~
+.DS_Store
