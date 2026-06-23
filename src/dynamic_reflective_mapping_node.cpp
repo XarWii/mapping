@@ -421,6 +421,7 @@ class MotionCompensator {
 
   void Reset() {
     initialized_ = false;
+    imu_history_.clear();
     trajectory_.clear();
   }
 
@@ -594,6 +595,9 @@ struct Config {
   std::string pose_input_frame = "lidar";
   std::string lidar_time_base = "header_stamp";
   std::string map_frame = "reflective_odom";
+  // livox_ros_driver2 forwards its native accelerometer measurement in g,
+  // even though sensor_msgs/Imu conventionally uses m/s^2.
+  double imu_acceleration_scale = 9.80665;
   int reflectivity_threshold = 160;
   float min_distance_m = 0.1f;
   float max_distance_m = 30.0f;
@@ -682,6 +686,8 @@ class DynamicReflectiveMappingNode {
                       config.pose_input_frame);
     private_nh_.param("lidar_time_base", config.lidar_time_base, config.lidar_time_base);
     private_nh_.param("map_frame", config.map_frame, config.map_frame);
+    private_nh_.param("imu_acceleration_scale", config.imu_acceleration_scale,
+                      config.imu_acceleration_scale);
     private_nh_.param("reflectivity_threshold", config.reflectivity_threshold,
                       config.reflectivity_threshold);
     private_nh_.param("min_distance_m", config.min_distance_m, config.min_distance_m);
@@ -756,7 +762,8 @@ class DynamicReflectiveMappingNode {
         config_.map_node_capacity >= config_.map_hash_capacity ||
         config_.voxel_size_m <= 0.0 || config_.merge_distance_m <= 0.0 ||
         config_.merge_distance_m > std::sqrt(3.0) * config_.voxel_size_m ||
-        config_.offset_time_scale_sec <= 0.0 || config_.worker_rate_hz <= 0.0 ||
+        config_.offset_time_scale_sec <= 0.0 || config_.imu_acceleration_scale <= 0.0 ||
+        config_.worker_rate_hz <= 0.0 ||
         config_.motion.max_imu_samples < 2 ||
         config_.imu_from_lidar_translation.size() != 3 ||
         config_.imu_from_lidar_rotation.size() != 9 ||
@@ -828,8 +835,18 @@ class DynamicReflectiveMappingNode {
                                 message->linear_acceleration.y,
                                 message->linear_acceleration.z);
     if (!IsFinite(time) || !IsFinite(gyro) || !IsFinite(accel)) return;
+    // A rosbag replay can restart its recorded clock while this node remains
+    // alive.  The old IMU history is then from the future and PushImu() would
+    // reject every sample in the new replay, leaving the mapper permanently
+    // unable to initialize.
+    constexpr double kTimeResetToleranceSec = 0.1;
+    if (IsFinite(latest_imu_time_) && time < latest_imu_time_ - kTimeResetToleranceSec) {
+      ROS_WARN("reflective mapper reset after IMU time moved backwards by %.3f s",
+               latest_imu_time_ - time);
+      ResetEpoch();
+    }
     latest_imu_time_ = std::max(latest_imu_time_, time);
-    motion_.PushImu(ImuSample{time, gyro, accel});
+    motion_.PushImu(ImuSample{time, gyro, accel * config_.imu_acceleration_scale});
   }
 
   void HandlePose(const nav_msgs::Odometry::ConstPtr& message) {
@@ -932,14 +949,23 @@ class DynamicReflectiveMappingNode {
   }
 
   std::optional<size_t> FindMatchingPose(const PendingScan& scan) const {
+    std::optional<size_t> match;
+    double closest_to_scan_end = std::numeric_limits<double>::infinity();
     for (size_t i = 0; i < pending_poses_.size(); ++i) {
       const double time = pending_poses_[i].time;
       if (time >= scan.imu_start_time - config_.pose_match_epsilon_sec &&
           time <= scan.imu_end_time + config_.pose_match_epsilon_sec) {
-        return i;
+        // LIO odometry is normally stamped at scan end.  A Livox frame spans
+        // about 100 ms and can contain two valid 10 Hz odometry samples, so
+        // picking the first queued sample produces a full-scan pose error.
+        const double distance_to_end = std::abs(time - scan.imu_end_time);
+        if (distance_to_end < closest_to_scan_end) {
+          closest_to_scan_end = distance_to_end;
+          match = i;
+        }
       }
     }
-    return std::nullopt;
+    return match;
   }
 
   void DiscardStalePoses(const PendingScan& scan) {
@@ -1021,6 +1047,8 @@ class DynamicReflectiveMappingNode {
   void ResetEpoch() {
     map_.Clear();
     motion_.Reset();
+    latest_imu_time_ = -std::numeric_limits<double>::infinity();
+    last_map_publish_time_ = -std::numeric_limits<double>::infinity();
     last_external_pose_.reset();
     pending_poses_.clear();
     while (!scan_order_.empty()) {

@@ -27,7 +27,7 @@
         name="dynamic_reflective_mapping_rviz"
         pkg="rviz"
         type="rviz"
-        args="-d $(find livox_reflective_marker)/config/dynamic_reflective_mapping.rviz">
+        args="-d '$(find livox_reflective_marker)/config/dynamic_reflective_mapping.rviz'">
     <env name="DISABLE_ROS1_EOL_WARNINGS" value="1"/>
   </node>
 </launch>

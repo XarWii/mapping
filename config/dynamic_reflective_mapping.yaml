@@ -12,6 +12,9 @@ dynamic_reflective_mapping:
   lidar_time_base: "header_stamp"
   offset_time_scale_sec: 1.0e-9
   lidar_to_imu_time_offset_sec: 0.0
+  # Livox Driver 2 publishes its native acceleration in g; convert it to m/s^2
+  # before the mapper's IMU propagation.
+  imu_acceleration_scale: 9.80665
   pose_match_epsilon_sec: 0.002
   pose_timeout_sec: 0.5
 
