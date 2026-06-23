@@ -592,6 +592,7 @@ struct Config {
   std::string imu_topic = "/livox/imu";
   std::string pose_topic = "/lio/odom";
   std::string pose_input_frame = "lidar";
+  std::string imu_acceleration_input_unit = "g";
   std::string lidar_time_base = "header_stamp";
   std::string map_frame = "reflective_odom";
   int reflectivity_threshold = 160;
@@ -655,9 +656,10 @@ class DynamicReflectiveMappingNode {
     worker_timer_ = nh_.createTimer(ros::Duration(1.0 / config_.worker_rate_hz),
                                     &DynamicReflectiveMappingNode::Worker, this);
 
-    ROS_INFO("Dynamic reflective mapper: lidar=%s imu=%s pose=%s map=%s",
+    ROS_INFO("Dynamic reflective mapper: lidar=%s imu=%s pose=%s map=%s accel_unit=%s",
              config_.lidar_topic.c_str(), config_.imu_topic.c_str(),
-             config_.pose_topic.c_str(), config_.debug_map_topic.c_str());
+             config_.pose_topic.c_str(), config_.debug_map_topic.c_str(),
+             config_.imu_acceleration_input_unit.c_str());
   }
 
  private:
@@ -680,6 +682,9 @@ class DynamicReflectiveMappingNode {
     private_nh_.param("pose_topic", config.pose_topic, config.pose_topic);
     private_nh_.param("pose_input_frame", config.pose_input_frame,
                       config.pose_input_frame);
+    private_nh_.param("imu_acceleration_input_unit",
+                      config.imu_acceleration_input_unit,
+                      config.imu_acceleration_input_unit);
     private_nh_.param("lidar_time_base", config.lidar_time_base, config.lidar_time_base);
     private_nh_.param("map_frame", config.map_frame, config.map_frame);
     private_nh_.param("reflectivity_threshold", config.reflectivity_threshold,
@@ -761,6 +766,8 @@ class DynamicReflectiveMappingNode {
         config_.imu_from_lidar_translation.size() != 3 ||
         config_.imu_from_lidar_rotation.size() != 9 ||
         (config_.pose_input_frame != "imu" && config_.pose_input_frame != "lidar") ||
+        (config_.imu_acceleration_input_unit != "g" &&
+         config_.imu_acceleration_input_unit != "mps2") ||
         (config_.lidar_time_base != "header_stamp" &&
          config_.lidar_time_base != "timebase_ns")) {
       throw std::runtime_error("invalid dynamic_reflective_mapping parameters");
@@ -824,9 +831,12 @@ class DynamicReflectiveMappingNode {
     const double time = message->header.stamp.toSec();
     const Eigen::Vector3d gyro(message->angular_velocity.x, message->angular_velocity.y,
                                message->angular_velocity.z);
-    const Eigen::Vector3d accel(message->linear_acceleration.x,
-                                message->linear_acceleration.y,
-                                message->linear_acceleration.z);
+    const Eigen::Vector3d raw_accel(message->linear_acceleration.x,
+                                    message->linear_acceleration.y,
+                                    message->linear_acceleration.z);
+    const double accel_scale = config_.imu_acceleration_input_unit == "g"
+        ? config_.motion.gravity_mps2 : 1.0;
+    const Eigen::Vector3d accel = raw_accel * accel_scale;
     if (!IsFinite(time) || !IsFinite(gyro) || !IsFinite(accel)) return;
     latest_imu_time_ = std::max(latest_imu_time_, time);
     motion_.PushImu(ImuSample{time, gyro, accel});

@@ -207,8 +207,21 @@ process.
 Each IMU sample must contain:
 
 - Timestamp in the IMU time domain used by all MotionCompensator queries.
-- Angular velocity.
-- Linear acceleration.
+- Angular velocity in `rad/s`.
+- Linear acceleration in `m/s^2` inside the MotionCompensator.
+
+All internal IMU acceleration, gravity, acceleration bias, and acceleration
+noise parameters use SI units. The current Livox ROS driver forwards its raw
+accelerometer values in `g` despite placing them in `sensor_msgs/Imu`. The
+input adapter therefore applies exactly one conversion at the boundary:
+
+```text
+acceleration_mps2 = acceleration_g * gravity_mps2
+```
+
+For the current Livox setup, configure `imu_acceleration_input_unit: g` and
+`gravity_mps2: 9.7946`. A future IMU adapter that already publishes `m/s^2`
+must use `imu_acceleration_input_unit: mps2`; it must not apply a second scale.
 
 The cache must retain samples covering a pending scan's converted IMU-time
 interval plus at least one bracketing sample after its end. A small fixed time

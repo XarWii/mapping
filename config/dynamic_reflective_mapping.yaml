@@ -3,6 +3,9 @@
 dynamic_reflective_mapping:
   lidar_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
+  # Current Livox ROS driver forwards raw accelerometer data in g. The mapper
+  # converts it once at input and uses m/s^2 exclusively after that boundary.
+  imu_acceleration_input_unit: "g"
   pose_topic: "/lio/odom"
   # /lio/odom is the 10 Hz LiDAR pose. The mapper converts it internally to
   # the IMU pose contract using T_imu_lidar below.
@@ -47,6 +50,7 @@ dynamic_reflective_mapping:
   external_position_margin_m: 0.5
   external_rotation_margin_rad: 0.3
 
+  # This is both the local gravity magnitude and the g -> m/s^2 scale above.
   gravity_mps2: 9.7946
   gyro_noise_std: 0.02
   accel_noise_std: 0.2
