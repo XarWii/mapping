@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   geometry_msgs
+  nav_msgs
   visualization_msgs
   std_msgs
   message_generation
@@ -46,7 +47,8 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS roscpp rospy sensor_msgs geometry_msgs visualization_msgs std_msgs
+  INCLUDE_DIRS include
+  CATKIN_DEPENDS roscpp rospy sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
                  message_runtime livox_ros_driver2
 )
 
@@ -66,6 +68,34 @@ else()
   message(WARNING "libdnn not found – siamese_bpu_infer_node will NOT be built")
   set(DNN_FOUND FALSE)
 endif()
+
+# ---------------------------------------------------------------------------
+# reflective_intensity_filter_node
+# ---------------------------------------------------------------------------
+add_executable(reflective_intensity_filter_node
+  src/reflective_intensity_filter_node.cpp
+)
+add_dependencies(reflective_intensity_filter_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+)
+target_link_libraries(reflective_intensity_filter_node
+  ${catkin_LIBRARIES}
+)
+
+# ---------------------------------------------------------------------------
+# dynamic_reflective_mapping_node
+# ---------------------------------------------------------------------------
+add_executable(dynamic_reflective_mapping_node
+  src/dynamic_reflective_mapping_node.cpp
+)
+add_dependencies(dynamic_reflective_mapping_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+)
+target_link_libraries(dynamic_reflective_mapping_node
+  ${catkin_LIBRARIES}
+)
 
 # ---------------------------------------------------------------------------
 # reflective_board_identifier_node
@@ -185,6 +215,8 @@ endif()
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS
+  reflective_intensity_filter_node
+  dynamic_reflective_mapping_node
   reflective_board_identifier_node
   reflective_board_template_recorder_node
   resource_monitor_node
@@ -210,4 +242,8 @@ catkin_install_python(PROGRAMS
 
 install(DIRECTORY launch config msg
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
+
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
 )

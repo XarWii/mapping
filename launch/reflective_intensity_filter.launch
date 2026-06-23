@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="config_file"
+       default="$(find livox_reflective_marker)/config/reflective_intensity_filter.yaml"/>
+  <arg name="rviz" default="true"/>
+
+  <rosparam command="load" file="$(arg config_file)"/>
+
+  <node name="reflective_intensity_filter"
+        pkg="livox_reflective_marker"
+        type="reflective_intensity_filter_node"
+        output="screen"/>
+
+  <node if="$(arg rviz)"
+        name="reflective_intensity_filter_rviz"
+        pkg="rviz"
+        type="rviz"
+        args="-d $(find livox_reflective_marker)/config/reflective_intensity_filter.rviz">
+    <env name="DISABLE_ROS1_EOL_WARNINGS" value="1"/>
+  </node>
+</launch>
