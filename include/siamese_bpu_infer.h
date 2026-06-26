@@ -1,26 +1,20 @@
 #pragma once
 
 /// @file siamese_bpu_infer.h
-/// @brief Lightweight C++ port of the Siamese PointNet V3 pre-processing and
-///        a minimal RAII wrapper around the RDK X5 BPU (hbDNN) inference API.
+/// @brief V8 C3 bag-split BPU pre-processing and a small hbDNN runtime wrapper.
 ///
-/// The BPU model expects two inputs:
-///   - candidate_nchw       [1, 3, 64, 1]  float32  (NCHW layout)
-///   - candidate_valid_ratio [1, 1, 1, 1]  float32
+/// Current deployment artifact:
+///   siamese_pointnet_explore/deployment/rdk_x5/v8_c3_bag_bpu/v8_c3_bag_qat.bin
 ///
-/// It outputs one scalar:
-///   - score                 [1, 1, 1, 1]  float32  (sigmoid already applied)
+/// The model contract is V8 C3, T=160/W=10 first deployment:
+///   input0 candidate_point        [1, 6, 192, 1] float32
+///   input1 candidate_mask         [1, 1, 192, 1] float32
+///   input2 candidate_meta         [1, 6, 1, 1]   float32
+///   input3 candidate_count_scale  [1, 1, 1, 1]   float32
+///   output logits                 [1, 1, 1, 1]   float32
 ///
-/// Usage
-/// -----
-///   BpuModel model;
-///   model.init("/path/to/model.bin");
-///   BpuPreprocessor pre(64);
-///   std::vector<Eigen::Vector3f> points = ...;
-///   pre.normalize(points);
-///   pre.fixedSize(points);
-///   float score = model.infer(pre.candidateNchw(), pre.validRatio());
-///
+/// The output is a logit-like score, not a sigmoid probability.  The deployment
+/// threshold is strict: positive iff score > -0.004310191.
 
 #include <dnn/hb_dnn.h>
 #include <dnn/hb_sys.h>
@@ -32,121 +26,213 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace siamese_bpu {
 
-// =========================================================================
-// Pre-processing  (Python → C++ port of normalize_points + fixed_size)
-// =========================================================================
+struct BpuPoint {
+  Eigen::Vector3f xyz = Eigen::Vector3f::Zero();
+  float reflectivity = 0.0f;
+};
 
 class BpuPreprocessor {
  public:
-  static constexpr int kNumPoints = 64;   // N in [1, 3, N, 1]
-  static constexpr int kInputChannels = 3;
+  static constexpr int kNumPoints = 192;
+  static constexpr int kPointChannels = 6;
+  static constexpr int kMetaDim = 6;
+  static constexpr int kNMin = 8;
+
+  static constexpr float kPhysicalScale = 0.22f;
+  static constexpr float kXyzClip = 2.0f;
+  static constexpr float kRhoClip = 3.0f;
+  static constexpr float kRangeScale = 10.0f;
 
   BpuPreprocessor() { reset(); }
 
-  /// Normalise a point cloud: centre at origin, scale to unit sphere.
-  /// Mutates `points` in-place; also stores per-point validity.
-  void normalize(std::vector<Eigen::Vector3f>& points) {
-    // Remove non-finite points
-    points.erase(
-        std::remove_if(points.begin(), points.end(),
-                       [](const Eigen::Vector3f& p) {
-                         return !p.allFinite();
-                       }),
-        points.end());
+  void prepare(const std::vector<BpuPoint>& raw_points,
+               float reflectivity_threshold = 160.0f) {
+    reset();
 
-    if (points.empty()) {
-      points.push_back(Eigen::Vector3f::Zero());
-    }
-
-    // Centre
-    Eigen::Vector3f mean = Eigen::Vector3f::Zero();
-    for (const auto& p : points) mean += p;
-    mean /= static_cast<float>(points.size());
-    for (auto& p : points) p -= mean;
-
-    // Scale to unit sphere
-    float max_radius = 0.0f;
-    for (const auto& p : points) {
-      max_radius = std::max(max_radius, p.norm());
-    }
-    if (max_radius > 1e-6f) {
-      const float scale = 1.0f / max_radius;
-      for (auto& p : points) p *= scale;
-    }
-  }
-
-  /// Resample to exactly kNumPoints points; build NCHW + valid-ratio tensors.
-  void fixedSize(const std::vector<Eigen::Vector3f>& points) {
-    const size_t n = points.size();
-    if (n == 0) {
-      // Should not happen after normalize(), but be defensive
-      std::fill(candidate_nchw_.begin(), candidate_nchw_.end(), 0.0f);
-      valid_ratio_ = 0.0f;
-      return;
-    }
-
-    size_t valid = 0;
-    std::vector<Eigen::Vector3f> sampled(kNumPoints, Eigen::Vector3f::Zero());
-
-    if (n >= static_cast<size_t>(kNumPoints)) {
-      // Uniformly subsample — truncation (same as np.linspace().astype(np.int64))
-      for (int i = 0; i < kNumPoints; ++i) {
-        size_t idx = static_cast<size_t>(
-            static_cast<double>(i) / (kNumPoints - 1) *
-            static_cast<double>(n - 1));
-        if (idx >= n) idx = n - 1;
-        sampled[i] = points[idx];
+    std::vector<BpuPoint> points;
+    points.reserve(raw_points.size());
+    for (const auto& p : raw_points) {
+      if (p.xyz.allFinite() && std::isfinite(p.reflectivity) &&
+          p.reflectivity >= reflectivity_threshold) {
+        points.push_back(p);
       }
-      valid = kNumPoints;
-    } else {
-      // Repeat (tile) to fill
-      for (int i = 0; i < kNumPoints; ++i) {
-        sampled[i] = points[i % n];
-      }
-      valid = n;
     }
 
-    // Write NCHW layout: [1, 3, 64, 1]
-    // candidate_nchw_[c * 64 + i] = sampled[i][c]
-    for (int i = 0; i < kNumPoints; ++i) {
-      candidate_nchw_[0 * kNumPoints + i] = sampled[i].x();   // channel 0
-      candidate_nchw_[1 * kNumPoints + i] = sampled[i].y();   // channel 1
-      candidate_nchw_[2 * kNumPoints + i] = sampled[i].z();   // channel 2
+    raw_count_ = points.size();
+    center_ = robustCenter(points);
+
+    std::vector<size_t> selected = deterministicSelect(points, center_);
+    valid_count_ = selected.size();
+
+    int clipped_coord_points = 0;
+    for (size_t out_i = 0; out_i < selected.size(); ++out_i) {
+      const BpuPoint& p = points[selected[out_i]];
+      const Eigen::Vector3f q = (p.xyz - center_) / kPhysicalScale;
+      const Eigen::Vector3f scaled = q / kXyzClip;
+      const bool clipped = std::abs(scaled.x()) > 1.0f ||
+                           std::abs(scaled.y()) > 1.0f ||
+                           std::abs(scaled.z()) > 1.0f;
+      if (clipped) ++clipped_coord_points;
+
+      candidate_point_[0 * kNumPoints + out_i] =
+          clamp(scaled.x(), -1.0f, 1.0f);
+      candidate_point_[1 * kNumPoints + out_i] =
+          clamp(scaled.y(), -1.0f, 1.0f);
+      candidate_point_[2 * kNumPoints + out_i] =
+          clamp(scaled.z(), -1.0f, 1.0f);
+      candidate_point_[3 * kNumPoints + out_i] =
+          clamp(q.norm() / kRhoClip, 0.0f, 1.0f);
+      candidate_point_[4 * kNumPoints + out_i] =
+          clamp(p.reflectivity, 0.0f, 255.0f) / 255.0f;
+      candidate_point_[5 * kNumPoints + out_i] =
+          clamp((p.reflectivity - 160.0f) / (255.0f - 160.0f), 0.0f, 1.0f);
+      candidate_mask_[out_i] = 1.0f;
     }
-    valid_ratio_ = static_cast<float>(valid) / static_cast<float>(kNumPoints);
+
+    const float raw_count_f = static_cast<float>(std::max<size_t>(raw_count_, 1));
+    const float valid_count_f = static_cast<float>(valid_count_);
+    const float overflow_ratio =
+        raw_count_ > kNumPoints
+            ? static_cast<float>(raw_count_ - kNumPoints) / raw_count_f
+            : 0.0f;
+    const float coord_clip_ratio =
+        valid_count_ > 0
+            ? static_cast<float>(clipped_coord_points) / valid_count_f
+            : 0.0f;
+
+    candidate_meta_[0] = valid_count_f / static_cast<float>(kNumPoints);
+    candidate_meta_[1] = clamp(overflow_ratio, 0.0f, 1.0f);
+    candidate_meta_[2] = clamp(center_.norm() / kRangeScale, 0.0f, 1.0f);
+    candidate_meta_[3] = clamp(reflectivity_threshold / 255.0f, 0.0f, 1.0f);
+    candidate_meta_[4] = coord_clip_ratio;
+    candidate_meta_[5] = valid_count_ >= kNMin ? 1.0f : 0.0f;
+
+    candidate_count_scale_ =
+        static_cast<float>(kNumPoints) /
+        static_cast<float>(std::max<size_t>(valid_count_, kNMin));
   }
 
-  /// Accessors for BPU input tensors.
-  const float* candidateNchw() const { return candidate_nchw_.data(); }
-  float validRatio() const { return valid_ratio_; }
+  const float* candidatePoint() const { return candidate_point_.data(); }
+  const float* candidateMask() const { return candidate_mask_.data(); }
+  const float* candidateMeta() const { return candidate_meta_.data(); }
+  float candidateCountScale() const { return candidate_count_scale_; }
 
-  /// Total bytes for candidate_nchw [1,3,64,1] float32.
-  static constexpr size_t candidateNchwBytes() {
-    return kInputChannels * kNumPoints * sizeof(float);
+  size_t rawCount() const { return raw_count_; }
+  size_t validCount() const { return valid_count_; }
+  float validRatio() const {
+    return static_cast<float>(valid_count_) / static_cast<float>(kNumPoints);
   }
-  static constexpr size_t validRatioBytes() { return sizeof(float); }
+  const Eigen::Vector3f& center() const { return center_; }
+
+  static constexpr size_t candidatePointBytes() {
+    return kPointChannels * kNumPoints * sizeof(float);
+  }
+  static constexpr size_t candidateMaskBytes() {
+    return kNumPoints * sizeof(float);
+  }
+  static constexpr size_t candidateMetaBytes() {
+    return kMetaDim * sizeof(float);
+  }
+  static constexpr size_t candidateCountScaleBytes() {
+    return sizeof(float);
+  }
 
   void reset() {
-    std::fill(candidate_nchw_.begin(), candidate_nchw_.end(), 0.0f);
-    valid_ratio_ = 1.0f;
+    std::fill(candidate_point_.begin(), candidate_point_.end(), 0.0f);
+    std::fill(candidate_mask_.begin(), candidate_mask_.end(), 0.0f);
+    std::fill(candidate_meta_.begin(), candidate_meta_.end(), 0.0f);
+    candidate_count_scale_ = static_cast<float>(kNumPoints) / kNMin;
+    raw_count_ = 0;
+    valid_count_ = 0;
+    center_ = Eigen::Vector3f::Zero();
   }
 
  private:
-  // NCHW layout: candidate_nchw[c][i] = sampled[i][c]
-  // Stored flat: channel 0 (64 floats), channel 1 (64 floats), channel 2 (64 floats)
-  std::array<float, kInputChannels * kNumPoints> candidate_nchw_{};
-  float valid_ratio_ = 1.0f;
-};
+  static float clamp(float v, float lo, float hi) {
+    if (!std::isfinite(v)) return lo;
+    return std::max(lo, std::min(hi, v));
+  }
 
-// =========================================================================
-// BPU Model  (RAII wrapper around hbDNN)
-// =========================================================================
+  static Eigen::Vector3f robustCenter(const std::vector<BpuPoint>& points) {
+    if (points.empty()) return Eigen::Vector3f::Zero();
+
+    std::array<std::vector<float>, 3> coords;
+    for (auto& v : coords) v.reserve(points.size());
+    for (const auto& p : points) {
+      coords[0].push_back(p.xyz.x());
+      coords[1].push_back(p.xyz.y());
+      coords[2].push_back(p.xyz.z());
+    }
+
+    Eigen::Vector3f median;
+    for (int axis = 0; axis < 3; ++axis) {
+      auto& v = coords[axis];
+      const size_t mid = v.size() / 2;
+      std::nth_element(v.begin(), v.begin() + static_cast<long>(mid), v.end());
+      float m = v[mid];
+      if (v.size() % 2 == 0) {
+        const float upper = m;
+        std::nth_element(v.begin(), v.begin() + static_cast<long>(mid - 1),
+                         v.end());
+        m = 0.5f * (v[mid - 1] + upper);
+      }
+      median[axis] = m;
+    }
+
+    std::vector<float> distances;
+    distances.reserve(points.size());
+    for (const auto& p : points) distances.push_back((p.xyz - median).norm());
+    const size_t qidx =
+        static_cast<size_t>(std::floor(0.75f * static_cast<float>(distances.size() - 1)));
+    std::nth_element(distances.begin(), distances.begin() + static_cast<long>(qidx),
+                     distances.end());
+    const float cutoff = distances[qidx] + 1.0e-8f;
+
+    Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+    size_t count = 0;
+    for (const auto& p : points) {
+      if ((p.xyz - median).norm() <= cutoff) {
+        sum += p.xyz;
+        ++count;
+      }
+    }
+    return count > 0 ? sum / static_cast<float>(count) : median;
+  }
+
+  static std::vector<size_t> deterministicSelect(
+      const std::vector<BpuPoint>& points, const Eigen::Vector3f& center) {
+    const size_t n = points.size();
+    const size_t out_n = std::min(n, static_cast<size_t>(kNumPoints));
+    std::vector<size_t> order(n);
+    std::iota(order.begin(), order.end(), static_cast<size_t>(0));
+    if (n > static_cast<size_t>(kNumPoints)) {
+      std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const float da = (points[a].xyz - center).squaredNorm();
+        const float db = (points[b].xyz - center).squaredNorm();
+        return da < db;
+      });
+    }
+    order.resize(out_n);
+    return order;
+  }
+
+  // NCHW flattened as [channel][point].
+  std::array<float, kPointChannels * kNumPoints> candidate_point_{};
+  std::array<float, kNumPoints> candidate_mask_{};
+  std::array<float, kMetaDim> candidate_meta_{};
+  float candidate_count_scale_ = 0.0f;
+  size_t raw_count_ = 0;
+  size_t valid_count_ = 0;
+  Eigen::Vector3f center_ = Eigen::Vector3f::Zero();
+};
 
 class BpuModel {
  public:
@@ -169,7 +255,6 @@ class BpuModel {
     return *this;
   }
 
-  /// Load the compiled .bin model.  Must be called once before infer().
   void init(const std::string& model_path) {
     release();
 
@@ -181,18 +266,20 @@ class BpuModel {
     int32_t model_count = 0;
     check(hbDNNGetModelNameList(&model_names, &model_count, packed_),
           "hbDNNGetModelNameList");
-    if (model_count < 1)
+    if (model_count < 1) {
       throw std::runtime_error("BPU model contains no sub-models");
+    }
 
     check(hbDNNGetModelHandle(&dnn_, packed_, model_names[0]),
           "hbDNNGetModelHandle");
 
-    int32_t in_cnt = 0, out_cnt = 0;
+    int32_t in_cnt = 0;
+    int32_t out_cnt = 0;
     check(hbDNNGetInputCount(&in_cnt, dnn_), "hbDNNGetInputCount");
     check(hbDNNGetOutputCount(&out_cnt, dnn_), "hbDNNGetOutputCount");
-    if (in_cnt != 2 || out_cnt != 1) {
+    if (in_cnt != 4 || out_cnt != 1) {
       throw std::runtime_error(
-          "BPU model expected 2 inputs / 1 output, got " +
+          "BPU V8 C3 model expected 4 inputs / 1 output, got " +
           std::to_string(in_cnt) + " / " + std::to_string(out_cnt));
     }
 
@@ -213,15 +300,21 @@ class BpuModel {
     HB_DNN_INITIALIZE_INFER_CTRL_PARAM(&ctrl_);
   }
 
-  /// Run inference.  `candidate_nchw` must point to 3*64 floats in NCHW
-  /// order; `valid_ratio` is a single float.  Returns sigmoid score [0,1].
-  float infer(const float* candidate_nchw, float valid_ratio) {
-    // Write input 0: candidate_nchw  [1, 3, 64, 1]
-    writeTensor(inputs_[0], candidate_nchw,
-                BpuPreprocessor::candidateNchwBytes());
-    // Write input 1: valid_ratio     [1, 1, 1, 1]
-    writeTensor(inputs_[1], &valid_ratio,
-                BpuPreprocessor::validRatioBytes());
+  float infer(const float* candidate_point,
+              const float* candidate_mask,
+              const float* candidate_meta,
+              float candidate_count_scale) {
+    // v8_c3_bag_qat.bin model_info order:
+    //   input0=candidate_point, input1=candidate_mask,
+    //   input2=candidate_meta,  input3=candidate_count_scale.
+    writeTensor(inputs_[0], candidate_point,
+                BpuPreprocessor::candidatePointBytes());
+    writeTensor(inputs_[1], candidate_mask,
+                BpuPreprocessor::candidateMaskBytes());
+    writeTensor(inputs_[2], candidate_meta,
+                BpuPreprocessor::candidateMetaBytes());
+    writeTensor(inputs_[3], &candidate_count_scale,
+                BpuPreprocessor::candidateCountScaleBytes());
 
     hbDNNTaskHandle_t task = nullptr;
     hbDNNTensor* output_ptr = outputs_.data();
@@ -238,7 +331,6 @@ class BpuModel {
     freeTensors(inputs_);
     freeTensors(outputs_);
     if (dnn_ && packed_) {
-      // hbDNNRelease releases the whole packed handle; dnn_ becomes invalid.
       hbDNNRelease(packed_);
     }
     packed_ = nullptr;
@@ -246,8 +338,9 @@ class BpuModel {
   }
 
   static void check(int32_t code, const std::string& ctx) {
-    if (code != 0)
+    if (code != 0) {
       throw std::runtime_error(ctx + " failed, code=" + std::to_string(code));
+    }
   }
 
   static void allocateTensor(hbDNNTensor& t) {

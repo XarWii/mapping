@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
 // resource_monitor_node
 //
-// Periodically reads /proc/<pid>/stat and /proc/<pid>/status for a target
-// ROS node (by default "reflective_board_identifier_node") and publishes
+// Periodically reads /proc/<pid>/stat, /proc/<pid>/status and
+// /proc/<pid>/smaps_rollup for a target ROS node and publishes
 // livox_reflective_marker/ResourceUsage messages on
 //   /resource_monitor_node/resource_usage
 //
@@ -18,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -37,19 +38,25 @@ namespace {
 // ---------------------------------------------------------------------------
 struct MonitorConfig {
   std::string target_node_name = "reflective_board_identifier_node";
+  std::string target_node_names;
   double publish_rate_hz = 2.0;          // how often to sample & publish
   double cpu_smoothing_alpha = 0.5f;     // EMA alpha for CPU percent (0..1)
+  bool aggregate = false;                // sum all target_node_names
+  bool ignore_missing_targets = true;
+  std::string memory_limit_metric = "pss";
 
   // Target thresholds for warnings
-  double memory_target_mb = 50.0;        // target max RSS memory in MB
+  double memory_target_mb = 50.0;
   double cpu_target_percent = 50.0;      // target max CPU usage in percent (half a core)
 };
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-struct MonitorState {
-  MonitorConfig config;
+struct TargetState {
+  explicit TargetState(std::string name_in = {}) : name(std::move(name_in)) {}
+
+  std::string name;
 
   // Cached PID (re-discovered on failure)
   int pid = -1;
@@ -62,8 +69,24 @@ struct MonitorState {
 
   // Smoothed CPU percent
   float cpu_percent_smoothed = 0.0f;
+};
+
+struct MonitorState {
+  MonitorConfig config;
+
+  std::vector<TargetState> targets;
+  TargetState self_target;
 
   ros::Publisher pub;
+  ros::Publisher component_pub;
+};
+
+struct SmapsRollup {
+  int64_t pss_kb = 0;
+  int64_t pss_anon_kb = 0;
+  int64_t pss_file_kb = 0;
+  int64_t pss_shmem_kb = 0;
+  int64_t uss_kb = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +99,17 @@ inline void Trim(std::string& s) {
       [](unsigned char ch) { return !std::isspace(ch); }));
   s.erase(std::find_if(s.rbegin(), s.rend(),
       [](unsigned char ch) { return !std::isspace(ch); }).base(), s.end());
+}
+
+std::vector<std::string> SplitTargetNames(const std::string& names) {
+  std::vector<std::string> out;
+  std::stringstream ss(names);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    Trim(item);
+    if (!item.empty()) out.push_back(item);
+  }
+  return out;
 }
 
 // Read the first line of a file.  Returns empty string on error.
@@ -288,6 +322,51 @@ bool ReadProcStatus(int pid,
   return true;
 }
 
+bool ReadKbValue(const std::string& line, const std::string& key,
+                 int64_t* value) {
+  if (value == nullptr || line.compare(0, key.size(), key) != 0) {
+    return false;
+  }
+  std::istringstream input(line.substr(key.size()));
+  int64_t parsed = 0;
+  std::string units;
+  if (!(input >> parsed >> units) || units != "kB") return false;
+  *value = parsed;
+  return true;
+}
+
+// PSS apportions shared mappings among their users. Summing PSS across only
+// the configured algorithm nodes avoids charging shared ROS/BPU libraries in
+// full to every process, while still retaining each node's fair share.
+bool ReadProcSmapsRollup(int pid, SmapsRollup* rollup) {
+  if (rollup == nullptr) return false;
+  std::ostringstream oss;
+  oss << "/proc/" << pid << "/smaps_rollup";
+  std::ifstream file(oss.str());
+  if (!file.is_open()) return false;
+
+  *rollup = SmapsRollup{};
+  bool have_pss = false;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (ReadKbValue(line, "Pss:", &rollup->pss_kb)) {
+      have_pss = true;
+    } else if (ReadKbValue(line, "Pss_Anon:", &rollup->pss_anon_kb) ||
+               ReadKbValue(line, "Pss_File:", &rollup->pss_file_kb) ||
+               ReadKbValue(line, "Pss_Shmem:", &rollup->pss_shmem_kb)) {
+      continue;
+    } else {
+      int64_t private_kb = 0;
+      if (ReadKbValue(line, "Private_Clean:", &private_kb) ||
+          ReadKbValue(line, "Private_Dirty:", &private_kb) ||
+          ReadKbValue(line, "Private_Hugetlb:", &private_kb)) {
+        rollup->uss_kb += private_kb;
+      }
+    }
+  }
+  return have_pss;
+}
+
 // ---------------------------------------------------------------------------
 // Read system-wide /proc/stat to get total jiffies.
 // ---------------------------------------------------------------------------
@@ -310,60 +389,73 @@ unsigned long long ReadSystemJiffies() {
 // ---------------------------------------------------------------------------
 // Main sampling + publishing logic
 // ---------------------------------------------------------------------------
-void SampleAndPublish(MonitorState* state) {
+bool SampleTarget(TargetState* target, const MonitorConfig& config,
+                  livox_reflective_marker::ResourceUsage* msg) {
+  if (target == nullptr || msg == nullptr) return false;
+
   // Re-discover PID if lost
-  if (state->pid < 0) {
-    if (!LookupPidByRosNode(state->config.target_node_name, &state->pid)) {
-      state->pid = FindPidByName(state->config.target_node_name);
+  if (target->pid < 0) {
+    if (!LookupPidByRosNode(target->name, &target->pid)) {
+      target->pid = FindPidByName(target->name);
     }
-    if (state->pid < 0) {
-      livox_reflective_marker::ResourceUsage msg;
-      msg.header.stamp = ros::Time::now();
-      msg.header.frame_id = "resource_monitor";
-      msg.node_name = state->config.target_node_name;
-      msg.cpu_percent = 0.0f;
-      msg.cpu_time_sec = 0.0f;
-      msg.memory_rss_kb = 0;
-      msg.memory_vm_kb = 0;
-      msg.pid = -1;
-      msg.alive = false;
-      state->pub.publish(msg);
-      ROS_INFO("resource: node=%s pid=not_found alive=false",
-               state->config.target_node_name.c_str());
-      return;
+    if (target->pid < 0) {
+      msg->header.stamp = ros::Time::now();
+      msg->header.frame_id = "resource_monitor";
+      msg->node_name = target->name;
+      msg->cpu_percent = 0.0f;
+      msg->cpu_time_sec = 0.0f;
+      msg->memory_rss_kb = 0;
+      msg->memory_pss_kb = 0;
+      msg->memory_pss_anon_kb = 0;
+      msg->memory_pss_file_kb = 0;
+      msg->memory_pss_shmem_kb = 0;
+      msg->memory_uss_kb = 0;
+      msg->memory_pss_available = false;
+      msg->memory_vm_kb = 0;
+      msg->pid = -1;
+      msg->alive = false;
+      return false;
     }
     ROS_INFO("resource_monitor: found '%s' with PID %d",
-             state->config.target_node_name.c_str(), state->pid);
-    state->have_prev = false;
+             target->name.c_str(), target->pid);
+    target->have_prev = false;
   }
 
   // Read memory
   int64_t rss_kb = 0, vm_kb = 0;
-  if (!ReadProcStatus(state->pid, rss_kb, vm_kb)) {
+  if (!ReadProcStatus(target->pid, rss_kb, vm_kb)) {
     ROS_WARN_THROTTLE(5.0,
       "resource_monitor: failed to read /proc/%d/status — process may have died",
-      state->pid);
-    state->pid = -1;
-    return;
+      target->pid);
+    target->pid = -1;
+    return false;
+  }
+  SmapsRollup rollup;
+  const bool pss_available = ReadProcSmapsRollup(target->pid, &rollup);
+  if (!pss_available) {
+    ROS_WARN_THROTTLE(5.0,
+        "resource_monitor: failed to read /proc/%d/smaps_rollup; "
+        "aggregate memory falls back to RSS",
+        target->pid);
   }
 
   // Read CPU ticks
   unsigned long long utime = 0, stime = 0;
-  if (!ReadProcStat(state->pid, utime, stime)) {
+  if (!ReadProcStat(target->pid, utime, stime)) {
     ROS_WARN_THROTTLE(5.0,
       "resource_monitor: failed to read /proc/%d/stat — process may have died",
-      state->pid);
-    state->pid = -1;
-    return;
+      target->pid);
+    target->pid = -1;
+    return false;
   }
 
   // Compute CPU percentage
   float cpu_percent = 0.0f;
-  if (state->have_prev) {
-    unsigned long long delta_proc = (utime - state->prev_utime) +
-                                    (stime - state->prev_stime);
+  if (target->have_prev) {
+    unsigned long long delta_proc = (utime - target->prev_utime) +
+                                    (stime - target->prev_stime);
     unsigned long long delta_sys =
-        ReadSystemJiffies() - state->prev_total_jiffies;
+        ReadSystemJiffies() - target->prev_total_jiffies;
 
     if (delta_sys > 0) {
       const long online_cores = std::max<long>(1, sysconf(_SC_NPROCESSORS_ONLN));
@@ -378,59 +470,173 @@ void SampleAndPublish(MonitorState* state) {
   }
 
   // EMA smoothing
-  const float alpha = state->config.cpu_smoothing_alpha;
-  if (state->have_prev) {
-    state->cpu_percent_smoothed =
-        alpha * cpu_percent + (1.0f - alpha) * state->cpu_percent_smoothed;
+  const float alpha = static_cast<float>(config.cpu_smoothing_alpha);
+  if (target->have_prev) {
+    target->cpu_percent_smoothed =
+        alpha * cpu_percent + (1.0f - alpha) * target->cpu_percent_smoothed;
   } else {
-    state->cpu_percent_smoothed = cpu_percent;
+    target->cpu_percent_smoothed = cpu_percent;
   }
 
-  state->prev_utime = utime;
-  state->prev_stime = stime;
-  state->prev_total_jiffies = ReadSystemJiffies();
-  state->have_prev = true;
+  target->prev_utime = utime;
+  target->prev_stime = stime;
+  target->prev_total_jiffies = ReadSystemJiffies();
+  target->have_prev = true;
 
   // Populate message
-  livox_reflective_marker::ResourceUsage msg;
-  msg.header.stamp = ros::Time::now();
-  msg.header.frame_id = "resource_monitor";
-  msg.node_name = state->config.target_node_name;
-  msg.cpu_percent = state->cpu_percent_smoothed;
-  msg.cpu_time_sec = static_cast<float>(utime + stime) /
-                     static_cast<float>(sysconf(_SC_CLK_TCK));
-  msg.memory_rss_kb = rss_kb;
-  msg.memory_vm_kb = vm_kb;
-  msg.pid = state->pid;
-  msg.alive = true;
+  msg->header.stamp = ros::Time::now();
+  msg->header.frame_id = "resource_monitor";
+  msg->node_name = target->name;
+  msg->cpu_percent = target->cpu_percent_smoothed;
+  msg->cpu_time_sec = static_cast<float>(utime + stime) /
+                      static_cast<float>(sysconf(_SC_CLK_TCK));
+  msg->memory_rss_kb = rss_kb;
+  msg->memory_pss_kb = rollup.pss_kb;
+  msg->memory_pss_anon_kb = rollup.pss_anon_kb;
+  msg->memory_pss_file_kb = rollup.pss_file_kb;
+  msg->memory_pss_shmem_kb = rollup.pss_shmem_kb;
+  msg->memory_uss_kb = rollup.uss_kb;
+  msg->memory_pss_available = pss_available;
+  msg->memory_vm_kb = vm_kb;
+  msg->pid = target->pid;
+  msg->alive = true;
+  return true;
+}
 
-  state->pub.publish(msg);
+void LogResourceMessage(const livox_reflective_marker::ResourceUsage& msg,
+                        const MonitorConfig& config, bool warn) {
+  const double rss_mb = static_cast<double>(msg.memory_rss_kb) / 1024.0;
+  const double pss_mb = static_cast<double>(msg.memory_pss_kb) / 1024.0;
+  const bool use_pss = config.memory_limit_metric == "pss" &&
+                       msg.memory_pss_available;
+  const double accounted_mb = use_pss ? pss_mb : rss_mb;
+  const double cpu_val = static_cast<double>(msg.cpu_percent);
 
-  const double rss_mb = static_cast<double>(rss_kb) / 1024.0;
-  const double cpu_val = static_cast<double>(state->cpu_percent_smoothed);
+  const double mem_target = config.memory_target_mb;
+  const double cpu_target = config.cpu_target_percent;
 
-  const double mem_target = state->config.memory_target_mb;
-  const double cpu_target = state->config.cpu_target_percent;
-
-  const char* mem_ok = (rss_mb <= mem_target) ? "OK" : "EXCEEDED";
+  const char* mem_ok = (accounted_mb <= mem_target) ? "OK" : "EXCEEDED";
   const char* cpu_ok = (cpu_val <= cpu_target) ? "OK" : "EXCEEDED";
 
-  ROS_INFO("resource: node=%s pid=%d cpu=%.1f%%/%0.f%%[%s] mem=%.1fMB/%0.fMB[%s] rss=%ldkB vm=%ldkB",
+  ROS_INFO("resource: node=%s pid=%d cpu=%.1f%%/%0.f%%[%s] %s=%.1fMB/%0.fMB[%s] pss=%.1fMB uss=%.1fMB rss=%.1fMB vm=%ldkB",
            msg.node_name.c_str(), msg.pid,
            cpu_val, cpu_target, cpu_ok,
-           rss_mb, mem_target, mem_ok,
-           static_cast<long>(rss_kb), static_cast<long>(vm_kb));
+           use_pss ? "pss" : "rss", accounted_mb, mem_target, mem_ok,
+           pss_mb, static_cast<double>(msg.memory_uss_kb) / 1024.0, rss_mb,
+           static_cast<long>(msg.memory_vm_kb));
 
-  if (rss_mb > mem_target) {
+  if (!warn) return;
+
+  if (accounted_mb > mem_target) {
     ROS_WARN_THROTTLE(2.0,
-      "resource_monitor: %s memory %.1f MB exceeds target %.0f MB",
-      msg.node_name.c_str(), rss_mb, mem_target);
+      "resource_monitor: %s accounted memory %.1f MB exceeds target %.0f MB",
+      msg.node_name.c_str(), accounted_mb, mem_target);
   }
   if (cpu_val > cpu_target) {
     ROS_WARN_THROTTLE(2.0,
       "resource_monitor: %s CPU %.1f%% exceeds target %.0f%%",
       msg.node_name.c_str(), cpu_val, cpu_target);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Main sampling + publishing logic
+// ---------------------------------------------------------------------------
+void SampleAndPublish(MonitorState* state) {
+  if (state == nullptr) return;
+
+  if (!state->config.aggregate) {
+    livox_reflective_marker::ResourceUsage msg;
+    if (!SampleTarget(&state->targets.front(), state->config, &msg)) {
+      state->pub.publish(msg);
+      ROS_INFO("resource: node=%s pid=not_found alive=false",
+               msg.node_name.c_str());
+      return;
+    }
+    state->pub.publish(msg);
+    LogResourceMessage(msg, state->config, true);
+    return;
+  }
+
+  livox_reflective_marker::ResourceUsage total;
+  total.header.stamp = ros::Time::now();
+  total.header.frame_id = "resource_monitor";
+  total.node_name = "TOTAL";
+  total.cpu_percent = 0.0f;
+  total.cpu_time_sec = 0.0f;
+  total.memory_rss_kb = 0;
+  total.memory_pss_kb = 0;
+  total.memory_pss_anon_kb = 0;
+  total.memory_pss_file_kb = 0;
+  total.memory_pss_shmem_kb = 0;
+  total.memory_uss_kb = 0;
+  total.memory_pss_available = true;
+  total.memory_vm_kb = 0;
+  total.pid = -1;
+  total.alive = true;
+
+  int alive_count = 0;
+  int expected_count = static_cast<int>(state->targets.size());
+  for (auto& target : state->targets) {
+    livox_reflective_marker::ResourceUsage msg;
+    if (!SampleTarget(&target, state->config, &msg)) {
+      total.alive = false;
+      if (!state->config.ignore_missing_targets) {
+        ROS_INFO("resource_total: node=%s pid=not_found alive=false",
+                 target.name.c_str());
+      }
+      continue;
+    }
+    state->component_pub.publish(msg);
+    ++alive_count;
+    total.cpu_percent += msg.cpu_percent;
+    total.cpu_time_sec += msg.cpu_time_sec;
+    total.memory_rss_kb += msg.memory_rss_kb;
+    total.memory_pss_kb += msg.memory_pss_kb;
+    total.memory_pss_anon_kb += msg.memory_pss_anon_kb;
+    total.memory_pss_file_kb += msg.memory_pss_file_kb;
+    total.memory_pss_shmem_kb += msg.memory_pss_shmem_kb;
+    total.memory_uss_kb += msg.memory_uss_kb;
+    total.memory_pss_available = total.memory_pss_available &&
+                                 msg.memory_pss_available;
+    total.memory_vm_kb += msg.memory_vm_kb;
+  }
+
+  // The monitor is not part of the algorithm budget, but publishing its own
+  // attributed memory makes the measurement overhead explicit.
+  livox_reflective_marker::ResourceUsage monitor_overhead;
+  const bool monitor_overhead_available =
+      SampleTarget(&state->self_target, state->config, &monitor_overhead);
+  if (monitor_overhead_available) {
+    state->component_pub.publish(monitor_overhead);
+  }
+
+  total.alive = state->config.ignore_missing_targets ? alive_count > 0
+                                                     : alive_count == expected_count;
+  state->pub.publish(total);
+
+  const double rss_mb = static_cast<double>(total.memory_rss_kb) / 1024.0;
+  const double pss_mb = static_cast<double>(total.memory_pss_kb) / 1024.0;
+  const bool use_pss = state->config.memory_limit_metric == "pss" &&
+                       total.memory_pss_available;
+  const double accounted_mb = use_pss ? pss_mb : rss_mb;
+  const double monitor_pss_mb = monitor_overhead_available &&
+                                  monitor_overhead.memory_pss_available
+      ? static_cast<double>(monitor_overhead.memory_pss_kb) / 1024.0
+      : 0.0;
+  const double cpu_val = static_cast<double>(total.cpu_percent);
+  const char* mem_ok =
+      (accounted_mb <= state->config.memory_target_mb) ? "OK" : "EXCEEDED";
+  const char* cpu_ok =
+      (cpu_val <= state->config.cpu_target_percent) ? "OK" : "EXCEEDED";
+  ROS_INFO("resource_total: nodes=%d/%d cpu=%.1f%%/%0.f%%[%s] %s=%.1fMB/%0.fMB[%s] pss=%.1fMB uss=%.1fMB rss_sum=%.1fMB monitor_pss=%.1fMB vm_sum=%ldkB",
+           alive_count, expected_count,
+           cpu_val, state->config.cpu_target_percent, cpu_ok,
+           use_pss ? "pss" : "rss_sum", accounted_mb,
+           state->config.memory_target_mb, mem_ok,
+           pss_mb, static_cast<double>(total.memory_uss_kb) / 1024.0, rss_mb,
+           monitor_pss_mb,
+           static_cast<long>(total.memory_vm_kb));
 }
 
 }  // namespace
@@ -443,24 +649,41 @@ int main(int argc, char* argv[]) {
   ros::NodeHandle pnh("~");
 
   MonitorState state;
+  state.self_target.name = ros::this_node::getName();
+  state.self_target.pid = static_cast<int>(getpid());
 
   // Load config
   pnh.param<std::string>("target_node_name",
       state.config.target_node_name, state.config.target_node_name);
+  pnh.param<std::string>("target_node_names",
+      state.config.target_node_names, state.config.target_node_names);
   pnh.param("publish_rate_hz", state.config.publish_rate_hz,
       state.config.publish_rate_hz);
   pnh.param("cpu_smoothing_alpha", state.config.cpu_smoothing_alpha,
       state.config.cpu_smoothing_alpha);
+  pnh.param("aggregate", state.config.aggregate, state.config.aggregate);
+  pnh.param("ignore_missing_targets", state.config.ignore_missing_targets,
+      state.config.ignore_missing_targets);
+  pnh.param<std::string>("memory_limit_metric", state.config.memory_limit_metric,
+      state.config.memory_limit_metric);
   pnh.param("memory_target_mb", state.config.memory_target_mb,
       state.config.memory_target_mb);
   pnh.param("cpu_target_percent", state.config.cpu_target_percent,
       state.config.cpu_target_percent);
   pnh.param<std::string>("resource_monitor/target_node_name",
       state.config.target_node_name, state.config.target_node_name);
+  pnh.param<std::string>("resource_monitor/target_node_names",
+      state.config.target_node_names, state.config.target_node_names);
   pnh.param("resource_monitor/publish_rate_hz", state.config.publish_rate_hz,
       state.config.publish_rate_hz);
   pnh.param("resource_monitor/cpu_smoothing_alpha",
       state.config.cpu_smoothing_alpha, state.config.cpu_smoothing_alpha);
+  pnh.param("resource_monitor/aggregate",
+      state.config.aggregate, state.config.aggregate);
+  pnh.param("resource_monitor/ignore_missing_targets",
+      state.config.ignore_missing_targets, state.config.ignore_missing_targets);
+  pnh.param<std::string>("resource_monitor/memory_limit_metric",
+      state.config.memory_limit_metric, state.config.memory_limit_metric);
   pnh.param("resource_monitor/memory_target_mb", state.config.memory_target_mb,
       state.config.memory_target_mb);
   pnh.param("resource_monitor/cpu_target_percent",
@@ -474,17 +697,46 @@ int main(int argc, char* argv[]) {
       std::max(1.0, state.config.memory_target_mb);
   state.config.cpu_target_percent =
       std::max(1.0, state.config.cpu_target_percent);
+  if (state.config.memory_limit_metric != "pss" &&
+      state.config.memory_limit_metric != "rss_sum") {
+    ROS_WARN("resource_monitor: unknown memory_limit_metric '%s'; using pss",
+             state.config.memory_limit_metric.c_str());
+    state.config.memory_limit_metric = "pss";
+  }
 
   state.pub = pnh.advertise<livox_reflective_marker::ResourceUsage>(
       "resource_usage", 10);
+  state.component_pub = pnh.advertise<livox_reflective_marker::ResourceUsage>(
+      "resource_components", 10);
+
+  std::vector<std::string> target_names;
+  if (state.config.aggregate) {
+    target_names = SplitTargetNames(state.config.target_node_names);
+  }
+  if (target_names.empty()) {
+    target_names.push_back(state.config.target_node_name);
+    state.config.aggregate = false;
+  }
+  state.targets.clear();
+  state.targets.reserve(target_names.size());
+  for (const auto& name : target_names) {
+    state.targets.emplace_back(name);
+  }
 
   ROS_INFO("resource_monitor_node started:");
-  ROS_INFO("  target_node_name=%s  rate=%.1f Hz  cpu_alpha=%.2f",
-           state.config.target_node_name.c_str(),
+  ROS_INFO("  mode=%s  rate=%.1f Hz  cpu_alpha=%.2f",
+           state.config.aggregate ? "aggregate" : "single",
            state.config.publish_rate_hz,
            state.config.cpu_smoothing_alpha);
-  ROS_INFO("  memory_target=%.0f MB  cpu_target=%.0f %%",
-           state.config.memory_target_mb,
+  if (state.config.aggregate) {
+    ROS_INFO("  target_node_names=%s  ignore_missing=%s",
+             state.config.target_node_names.c_str(),
+             state.config.ignore_missing_targets ? "true" : "false");
+  } else {
+    ROS_INFO("  target_node_name=%s", state.config.target_node_name.c_str());
+  }
+  ROS_INFO("  memory_target=%.0f MB metric=%s  cpu_target=%.0f %%",
+           state.config.memory_target_mb, state.config.memory_limit_metric.c_str(),
            state.config.cpu_target_percent);
 
   ros::Rate rate(state.config.publish_rate_hz);

@@ -15,9 +15,28 @@ float32 cpu_percent
 float32 cpu_time_sec
 
 # --- Memory ---
-# Resident Set Size (physical memory) in kilobytes.
+# Resident Set Size in kilobytes. Includes fully shared mappings, so it is
+# useful for per-process diagnosis but must not be summed across processes.
 # From /proc/[pid]/status VmRSS.
 int64 memory_rss_kb
+
+# Proportional Set Size in kilobytes. Shared mappings are apportioned across
+# every process mapping them; this is the accounting metric for a node group.
+# From /proc/[pid]/smaps_rollup Pss.
+int64 memory_pss_kb
+
+# PSS split by backing type, in kilobytes. These fields make the aggregate
+# accountable without charging external processes' shared library pages twice.
+int64 memory_pss_anon_kb
+int64 memory_pss_file_kb
+int64 memory_pss_shmem_kb
+
+# Unique Set Size in kilobytes: pages private to this process only. This is
+# Private_Clean + Private_Dirty + Private_Hugetlb from smaps_rollup.
+int64 memory_uss_kb
+
+# False only when smaps_rollup could not be read for this process.
+bool memory_pss_available
 
 # Virtual memory size in kilobytes.
 # From /proc/[pid]/status VmSize.
