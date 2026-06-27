@@ -2,15 +2,17 @@
 <launch>
   <arg name="config_file"
        default="$(find livox_reflective_marker)/config/dynamic_reflective_mapping.yaml"/>
-  <arg name="filter_config_file"
-       default="$(find livox_reflective_marker)/config/reflective_intensity_filter.yaml"/>
   <arg name="start_intensity_filter" default="false"/>
+  <arg name="start_candidate_extractor" default="true"/>
+  <arg name="start_bpu_scorer" default="true"/>
+  <arg name="use_observation_bpu_scorer" default="true"/>
+  <arg name="start_map_decision" default="true"/>
+  <arg name="start_pose_estimator" default="true"/>
   <arg name="rviz" default="true"/>
 
   <rosparam command="load" file="$(arg config_file)"/>
 
   <group if="$(arg start_intensity_filter)">
-    <rosparam command="load" file="$(arg filter_config_file)"/>
     <node name="reflective_intensity_filter"
           pkg="livox_reflective_marker"
           type="reflective_intensity_filter_node"
@@ -23,11 +25,57 @@
         output="screen"
         required="true"/>
 
+  <group if="$(arg start_candidate_extractor)">
+    <node name="reflective_candidate_extractor"
+          pkg="livox_reflective_marker"
+          type="reflective_candidate_extractor_node"
+          output="screen"
+          required="true"/>
+  </group>
+
+  <group if="$(arg start_bpu_scorer)">
+    <group if="$(arg use_observation_bpu_scorer)">
+      <node name="reflective_observation_bpu_scorer"
+            pkg="livox_reflective_marker"
+            type="reflective_observation_bpu_scorer_node"
+            output="screen"
+            required="true"/>
+    </group>
+    <group unless="$(arg use_observation_bpu_scorer)">
+      <node name="reflective_bpu_scorer"
+            pkg="livox_reflective_marker"
+            type="reflective_bpu_scorer_node"
+            output="screen"
+            required="true"/>
+    </group>
+  </group>
+
+  <group if="$(arg start_map_decision)">
+    <node name="reflective_map_decision"
+          pkg="livox_reflective_marker"
+          type="reflective_map_decision_node"
+          output="screen"
+          required="true"/>
+  </group>
+
+  <group if="$(arg start_pose_estimator)">
+    <node name="reflective_board_pose_estimator"
+          pkg="livox_reflective_marker"
+          type="reflective_board_pose_estimator_node"
+          output="screen"
+          required="true"/>
+  </group>
+
+  <node name="resource_monitor_dynamic_total"
+        pkg="livox_reflective_marker"
+        type="resource_monitor_node"
+        output="screen"/>
+
   <node if="$(arg rviz)"
         name="dynamic_reflective_mapping_rviz"
         pkg="rviz"
         type="rviz"
-        args="-d '$(find livox_reflective_marker)/config/dynamic_reflective_mapping.rviz'">
+        args="-d $(find livox_reflective_marker)/config/rviz/dynamic_reflective_mapping.rviz">
     <env name="DISABLE_ROS1_EOL_WARNINGS" value="1"/>
   </node>
 </launch>

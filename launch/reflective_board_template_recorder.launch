@@ -3,8 +3,11 @@
 
   <arg name="start_driver" default="true"/>
   <arg name="input_topic" default="/livox/lidar"/>
+  <arg name="template_output_dir"
+       default="$(find livox_reflective_marker)/config/board_templates"/>
+  <arg name="board_id" default="board_01"/>
   <arg name="output_path"
-       default="$(find livox_reflective_marker)/config/target_board_template.yaml"/>
+       default="$(arg template_output_dir)/$(arg board_id).yaml"/>
   <arg name="driver_launch_prefix" default=""/>
   <arg name="driver_output" default="log"/>
 
@@ -31,7 +34,7 @@
         output="screen"
         required="true">
     <rosparam command="load"
-              file="$(find livox_reflective_marker)/config/params.yaml"/>
+              file="$(find livox_reflective_marker)/config/reflective_board_template_recorder.yaml"/>
     <param name="input_topic" value="$(arg input_topic)"/>
     <param name="template_recorder/output_path" value="$(arg output_path)"/>
   </node>

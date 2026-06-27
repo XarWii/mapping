@@ -3,10 +3,16 @@
 dynamic_reflective_mapping:
   lidar_topic: "/livox/lidar"
   imu_topic: "/livox/imu"
+  # Current Livox ROS driver forwards raw accelerometer data in g. The mapper
+  # converts it once at input and uses m/s^2 exclusively after that boundary.
+  imu_acceleration_input_unit: "g"
   pose_topic: "/lio/odom"
   # /lio/odom is the 10 Hz LiDAR pose. The mapper converts it internally to
   # the IMU pose contract using T_imu_lidar below.
   pose_input_frame: "lidar"
+  # Empty means use /lio/odom.header.frame_id, normally the LIO map frame.
+  # The first valid pose anchors: external_odom_frame -> reflective_odom.
+  external_odom_frame: ""
 
   # Must be verified from a dynamic bag before freezing the configuration.
   lidar_time_base: "header_stamp"
@@ -16,12 +22,22 @@ dynamic_reflective_mapping:
   # before the mapper's IMU propagation.
   imu_acceleration_scale: 9.80665
   pose_match_epsilon_sec: 0.002
-  pose_timeout_sec: 0.5
+  # Match the low-rate odometry pose nearest to each scan end.  Super-LIO is
+  # nominally 10 Hz, so this window prevents occasional timestamp phase offsets
+  # from blocking the whole scan queue.
+  pose_match_max_time_diff_sec: 0.06
+  # Avoid using a pose too far in the future, because pose correction restarts
+  # the IMU trajectory at the correction timestamp.
+  pose_match_max_future_sec: 0.01
+  # The mapper retains raw scans until the pose with the corresponding sensor
+  # timestamp arrives.  Two seconds also covers starting this node after LIO.
+  pose_timeout_sec: 2.0
 
   map_frame: "reflective_odom"
+  lidar_frame: "livox_frame"
   reflectivity_threshold: 160
   min_distance_m: 0.1
-  max_distance_m: 30.0
+  max_distance_m: 15.0
 
   # T_imu_lidar: p_imu = R_imu_lidar * p_lidar + t_imu_lidar.
   # These initial values match the current Super-LIO Livox configuration.
@@ -30,19 +46,24 @@ dynamic_reflective_mapping:
                              0.0, 1.0, 0.0,
                              0.0, 0.0, 1.0]
 
-  max_pending_scans: 4
-  max_pending_poses: 8
+  # 24 Livox frames at 10 Hz covers the two-second pose wait above.  This is
+  # bounded storage, not an unbounded startup backlog.
+  max_pending_scans: 24
+  max_pending_poses: 32
   max_high_points_per_scan: 8192
   max_imu_samples: 800
-  worker_rate_hz: 250.0
+  worker_rate_hz: 200.0
 
   wheel_tick_sec: 0.05
-  ttl_sec: 10.0
+  # Positive values retain a rolling map for this many seconds.  Set exactly
+  # -1 to disable TTL expiry; map capacity then evicts the oldest voxel only
+  # when full, so memory remains bounded.
+  ttl_sec: -1
   map_hash_capacity: 65536
   map_node_capacity: 32768
   wheel_bucket_count: 128
-  voxel_size_m: 0.05
-  merge_distance_m: 0.05
+  voxel_size_m: 0.003
+  merge_distance_m: 0.003
 
   # Gate discontinuous external outputs before they can mix map epochs.
   max_external_velocity_mps: 5.0
@@ -50,6 +71,7 @@ dynamic_reflective_mapping:
   external_position_margin_m: 0.5
   external_rotation_margin_rad: 0.3
 
+  # Local gravity magnitude used by IMU propagation and bias initialization.
   gravity_mps2: 9.7946
   gyro_noise_std: 0.02
   accel_noise_std: 0.2
@@ -62,4 +84,143 @@ dynamic_reflective_mapping:
   # Enable while validating. Disable in the final resource measurement run.
   publish_debug_map: true
   debug_map_topic: "/reflective/rolling_map"
-  debug_map_publish_rate_hz: 1.0
+  debug_map_publish_rate_hz: 5.0
+
+  # Typed map interface for the candidate extractor.  Unlike Header.seq it
+  # carries an explicit map epoch, so stale candidates cannot survive a reset.
+  publish_map_snapshot: true
+  map_snapshot_topic: "/reflective/map_snapshot"
+  publish_deskewed_high_ref_cloud: true
+  deskewed_high_ref_cloud_topic: "/reflective/deskewed_high_ref_cloud"
+  publish_observation_frame: true
+  observation_frame_topic: "/reflective/observation_frame"
+  max_observation_points_per_frame: 4096
+  observation_source_contract_hash: 0
+  # Local visualization path built from poses received after this mapper starts.
+  # This avoids showing Super-LIO's pre-existing /lio/path history in RViz.
+  publish_path_since_start: true
+  path_since_start_topic: "/reflective/path_since_start"
+  # 20000 poses is about 33 minutes at 10 Hz. Set 0 to disable path storage.
+  max_path_poses: 20000
+
+# Optional first stage.  It preserves Livox CustomPoint offset_time, so it can
+# be enabled before the mapper without changing the deskew contract.
+reflective_intensity_filter:
+  input_topic: "/livox/lidar"
+  output_topic: "/reflective/high_reflect_points"
+  reflectivity_threshold: 160
+  queue_size: 1
+  publish_visualization: true
+  visualization_topic: "/reflective/high_reflect_points_visualization"
+
+# Rolling high-reflectivity voxel map -> bounded candidate regions.
+reflective_candidate_extractor:
+  map_snapshot_topic: "/reflective/map_snapshot"
+  map_frame: "reflective_odom"
+  input_queue_size: 1
+  # Phase 1 uses full snapshots, but never queues them up.  The subscriber
+  # queue is 1 and this period limits visualization/CPU churn.
+  extract_snapshot_period_sec: 0.2
+  max_snapshot_fine_refs: 32768
+  max_candidates: 64
+  min_intensity: 160.0
+  grid_origin_map: [0.0, 0.0, 0.0]
+  mid_cell_size_m: 0.06
+  evidence_aggregation_cap: 8
+  mid_active_evidence_threshold: 3
+  mid_active_min_fine_voxels: 3
+  d_bridge_cells: 1
+  # AABB ROI = seed support bbox expanded by this map-frame margin.
+  roi_completion_margin_m: 0.12
+  min_map_support_voxels: 12
+  min_map_support_evidence: 12
+  max_candidate_span_m: 0.85
+  # -1 keeps candidate ids/records after they leave the current FoV.
+  keep_time_s: -1
+  candidate_association_iou_threshold: 0.20
+  roi_dedup_iou_threshold: 0.60
+  candidates_topic: "/reflective/candidates"
+  candidate_cloud_topic: "/reflective/candidate_cloud"
+  markers_topic: "/reflective/candidate_markers"
+
+# BPU scorer for map candidates.  This is the dynamic mapping route: the map
+# finds stable candidate ROIs, while BPU input is rebuilt from bounded real
+# observation windows in a single anchor LiDAR frame.
+reflective_observation_bpu_scorer:
+  candidates_topic: "/reflective/candidates"
+  observation_frame_topic: "/reflective/observation_frame"
+  scores_topic: "/reflective/recognition_scores"
+  recognition_request_topic: "/reflective/recognition_request"
+  bpu_model_path: "/home/sunrise/catkin_ws/siamese_pointnet_explore/deployment/rdk_x5/v8_c3_bag_bpu/v8_c3_bag_qat.bin"
+  expected_observation_source_contract_hash: 0
+  reflectivity_threshold: 160.0
+  raw_ring_max_frames: 80
+  window_size_frames: 10
+  max_candidate_window_pairs_per_request: 64
+  max_window_points: 5000
+  min_cluster_points: 3
+  max_cluster_points: 2000
+  min_inference_points: 8
+  min_roi_cluster_points: 3
+  cluster_tolerance_m: 0.25
+  roi_padding_m: 0.03
+  allow_truncated_frames: false
+
+# Legacy fallback scorer.  It scores candidate.cloud_sensor and is kept only
+# for A/B comparison while the observation-window scorer is validated.
+reflective_bpu_scorer:
+  candidates_topic: "/reflective/candidates"
+  scores_topic: "/reflective/recognition_scores"
+  recognition_request_topic: "/reflective/recognition_request"
+  bpu_model_path: "/home/sunrise/catkin_ws/siamese_pointnet_explore/deployment/rdk_x5/v8_c3_bag_bpu/v8_c3_bag_qat.bin"
+  reflectivity_threshold: 160.0
+  min_inference_points: 8
+
+# Event-driven decision for the dynamic route; it never sends EKF commands.
+reflective_map_decision:
+  candidates_topic: "/reflective/candidates"
+  scores_topic: "/reflective/recognition_scores"
+  recognition_request_topic: "/reflective/recognition_request"
+  target_state_topic: "/reflective/target_state"
+  active_candidate_topic: "/reflective/active_candidate"
+  target_center_topic: "/reflective/target_center"
+  target_marker_topic: "/reflective/target_marker"
+  selection_score_threshold: -0.004310191
+  selection_margin_threshold: 0.015
+  single_candidate_virtual_second_score: -0.004310191
+  # Do not lock onto the first scoreable region that appears while the map is
+  # still sparse. Wait until at least two candidates are scored together.
+  min_scored_candidates_for_selection: 2
+  min_candidate_points_for_request: 32
+  # Retry a rejected region only after its BPU input has materially densified.
+  rescore_min_added_points: 8
+  request_timeout_sec: 1.0
+
+# Geometry-only board pose output for a confirmed map candidate.  No KF.
+reflective_board_pose_estimator:
+  active_candidate_topic: "/reflective/active_candidate"
+  target_state_topic: "/reflective/target_state"
+  target_pose_topic: "/reflective/target_pose"
+  target_pose_status_topic: "/reflective/target_pose_status"
+  normal_marker_topic: "/reflective/target_normal_marker"
+  normal_marker_length_m: 0.35
+  min_points: 8
+  max_plane_rms_m: 0.06
+  min_inplane_eigen_ratio: 1.10
+  max_center_jump_m: 0.30
+  max_normal_change_deg: 35.0
+  stale_timeout_sec: 4.0
+
+# Dynamic mapping resource accounting. The aggregate monitor samples only the
+# algorithm nodes below. RViz, the Livox driver and Super-LIO are excluded.
+# The monitor's own PSS is recorded separately as measurement overhead, not
+# charged to the algorithm budget. PSS and USS are recorded for diagnosis;
+# use RSS sum as the conservative limit metric during initial validation.
+resource_monitor_dynamic_total:
+  aggregate: true
+  target_node_names: "dynamic_reflective_mapping,reflective_candidate_extractor,reflective_observation_bpu_scorer,reflective_bpu_scorer,reflective_map_decision,reflective_board_pose_estimator,reflective_intensity_filter"
+  ignore_missing_targets: true
+  publish_rate_hz: 1.0
+  memory_limit_metric: "rss_sum"
+  cpu_target_percent: 50.0
+  memory_target_mb: 50.0

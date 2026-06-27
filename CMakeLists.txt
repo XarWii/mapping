@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   visualization_msgs
   std_msgs
+  tf2_ros
   message_generation
   livox_ros_driver2
 )
@@ -27,16 +28,21 @@ find_package(Eigen3 REQUIRED)
 add_message_files(
   FILES
   ResourceUsage.msg
-  CandidateValidationRequest.msg
-  CandidateValidationResult.msg
   BpuScoreEntry.msg
   BpuScores.msg
   ClusterCloud.msg
   RecognitionCommand.msg
-  TraditionalScoreEntry.msg
-  TraditionalScores.msg
   TargetCommand.msg
   EkfStatus.msg
+  ReflectiveCandidate.msg
+  ReflectiveCandidates.msg
+  ReflectiveMapSnapshot.msg
+  ReflectiveObservationFrame.msg
+  RecognitionScoreEntry.msg
+  RecognitionScores.msg
+  ReflectiveRecognitionRequest.msg
+  ReflectiveTargetState.msg
+  ReflectiveBoardPose.msg
 )
 
 generate_messages(
@@ -48,7 +54,7 @@ generate_messages(
 
 catkin_package(
   INCLUDE_DIRS include
-  CATKIN_DEPENDS roscpp rospy sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs
+  CATKIN_DEPENDS roscpp rospy sensor_msgs geometry_msgs nav_msgs visualization_msgs std_msgs tf2_ros
                  message_runtime livox_ros_driver2
 )
 
@@ -98,17 +104,44 @@ target_link_libraries(dynamic_reflective_mapping_node
 )
 
 # ---------------------------------------------------------------------------
-# reflective_board_identifier_node
+# reflective_candidate_extractor_node
 # ---------------------------------------------------------------------------
-add_executable(reflective_board_identifier_node
-  src/reflective_board_identifier_node.cpp
+add_executable(reflective_candidate_extractor_node
+  src/reflective_candidate_extractor_node.cpp
 )
-add_dependencies(reflective_board_identifier_node
+add_dependencies(reflective_candidate_extractor_node
   ${catkin_EXPORTED_TARGETS}
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
 )
+target_link_libraries(reflective_candidate_extractor_node
+  ${catkin_LIBRARIES}
+)
 
-target_link_libraries(reflective_board_identifier_node
+# ---------------------------------------------------------------------------
+# reflective_map_decision_node
+# ---------------------------------------------------------------------------
+add_executable(reflective_map_decision_node
+  src/reflective_map_decision_node.cpp
+)
+add_dependencies(reflective_map_decision_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+)
+target_link_libraries(reflective_map_decision_node
+  ${catkin_LIBRARIES}
+)
+
+# ---------------------------------------------------------------------------
+# reflective_board_pose_estimator_node
+# ---------------------------------------------------------------------------
+add_executable(reflective_board_pose_estimator_node
+  src/reflective_board_pose_estimator_node.cpp
+)
+add_dependencies(reflective_board_pose_estimator_node
+  ${catkin_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+)
+target_link_libraries(reflective_board_pose_estimator_node
   ${catkin_LIBRARIES}
 )
 
@@ -142,20 +175,6 @@ target_link_libraries(target_manager_node
 )
 
 # ---------------------------------------------------------------------------
-# traditional_validator_node
-# ---------------------------------------------------------------------------
-add_executable(traditional_validator_node
-  src/traditional_validator_node.cpp
-)
-add_dependencies(traditional_validator_node
-  ${catkin_EXPORTED_TARGETS}
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-)
-target_link_libraries(traditional_validator_node
-  ${catkin_LIBRARIES}
-)
-
-# ---------------------------------------------------------------------------
 # resource_monitor_node
 # ---------------------------------------------------------------------------
 add_executable(resource_monitor_node src/resource_monitor_node.cpp)
@@ -169,35 +188,33 @@ target_link_libraries(resource_monitor_node
 )
 
 # ---------------------------------------------------------------------------
-# reflective_board_dataset_collector_node
-# ---------------------------------------------------------------------------
-add_executable(reflective_board_dataset_collector_node
-  src/reflective_board_dataset_collector_node.cpp
-)
-add_dependencies(reflective_board_dataset_collector_node
-  ${catkin_EXPORTED_TARGETS}
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
-)
-
-target_link_libraries(reflective_board_dataset_collector_node
-  ${catkin_LIBRARIES}
-)
-
-# ---------------------------------------------------------------------------
-# reflective_board_yaml_traditional_eval
-# ---------------------------------------------------------------------------
-add_executable(reflective_board_yaml_traditional_eval
-  src/reflective_board_yaml_traditional_eval.cpp
-)
-
-target_link_libraries(reflective_board_yaml_traditional_eval
-  ${catkin_LIBRARIES}
-)
-
-# ---------------------------------------------------------------------------
 # siamese_bpu_infer_node  (BPU-accelerated V3 Siamese PointNet inference)
 # ---------------------------------------------------------------------------
 if(DNN_FOUND)
+  add_executable(reflective_observation_bpu_scorer_node
+    src/reflective_observation_bpu_scorer_node.cpp
+  )
+  add_dependencies(reflective_observation_bpu_scorer_node
+    ${catkin_EXPORTED_TARGETS}
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  )
+  target_link_libraries(reflective_observation_bpu_scorer_node
+    ${catkin_LIBRARIES}
+    ${DNN_LIB}
+  )
+
+  add_executable(reflective_bpu_scorer_node
+    src/reflective_bpu_scorer_node.cpp
+  )
+  add_dependencies(reflective_bpu_scorer_node
+    ${catkin_EXPORTED_TARGETS}
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  )
+  target_link_libraries(reflective_bpu_scorer_node
+    ${catkin_LIBRARIES}
+    ${DNN_LIB}
+  )
+
   add_executable(siamese_bpu_infer_node
     src/siamese_bpu_infer_node.cpp
   )
@@ -217,18 +234,19 @@ endif()
 install(TARGETS
   reflective_intensity_filter_node
   dynamic_reflective_mapping_node
-  reflective_board_identifier_node
+  reflective_candidate_extractor_node
+  reflective_map_decision_node
+  reflective_board_pose_estimator_node
   reflective_board_template_recorder_node
   resource_monitor_node
-  reflective_board_dataset_collector_node
-  reflective_board_yaml_traditional_eval
-  traditional_validator_node
   target_manager_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 if(DNN_FOUND)
   install(TARGETS
+    reflective_observation_bpu_scorer_node
+    reflective_bpu_scorer_node
     siamese_bpu_infer_node
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
   )
@@ -236,7 +254,10 @@ endif()
 
 catkin_install_python(PROGRAMS
   scripts/analyze_target_pose_jitter.py
+  scripts/auto_label_board_candidates.py
   scripts/clicked_pointcloud2_reflectivity.py
+  scripts/pointcloud2_intensity_filter.py
+  scripts/relabel_auto_board_candidate.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

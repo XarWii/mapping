@@ -1,0 +1,17 @@
+# Parameters for reflective_board_template_recorder_node.
+template_recorder:
+  output_path: "/tmp/target_board_template.yaml"
+  min_accumulation_sec: 5
+  max_recording_sec: 30.0
+  target_template_points: 600
+  cluster_tolerance_m: 0.35
+  min_cluster_points: 20
+  max_accumulated_points: 20000
+  max_saved_points: 5000
+  save_preview_image: true
+  # Empty means derive from output_path, e.g. board_01.yaml -> board_01_uv.bmp.
+  preview_image_path: ""
+  preview_image_size_px: 640
+  preview_image_padding_px: 48
+  preview_point_radius_px: 2
+  auto_shutdown_after_save: false

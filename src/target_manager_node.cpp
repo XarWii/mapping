@@ -15,8 +15,6 @@
 
 #include <livox_reflective_marker/BpuScoreEntry.h>
 #include <livox_reflective_marker/BpuScores.h>
-#include <livox_reflective_marker/CandidateValidationRequest.h>
-#include <livox_reflective_marker/CandidateValidationResult.h>
 #include <livox_reflective_marker/ClusterCloud.h>
 #include <livox_reflective_marker/EkfStatus.h>
 #include <livox_reflective_marker/RecognitionCommand.h>
@@ -88,8 +86,6 @@ struct Config {
   std::string bpu_scores_topic = "/siamese_bpu_infer_node/bpu_scores";
   std::string cluster_cloud_topic =
       "/siamese_bpu_infer_node/latest_cluster_cloud";
-  std::string validation_result_topic =
-      "/siamese_bpu_infer_node/validation_result";
   std::string ekf_status_topic = "/ekf_pose_node/ekf_status";
 
   // Outputs.
@@ -98,8 +94,6 @@ struct Config {
   std::string recognition_command_topic =
       "/target_manager/recognition_command";
   std::string colored_cloud_topic = "/target_manager/colored_high_points";
-  std::string validation_request_topic =
-      "/siamese_bpu_infer_node/validation_request";
 
   std::string frame_id = "livox_frame";
 
@@ -115,6 +109,7 @@ struct Config {
   int init_required_frames = 5;
   float init_score_threshold = 0.3825f;
   float init_margin_threshold = 0.20f;
+  float single_candidate_virtual_second_score = 0.10f;
 
   // Periodic audit while RECOGNIZED.
   double audit_interval_sec = 5.0;
@@ -153,11 +148,6 @@ struct Config {
   // Visualization.
   float target_cluster_match_distance_m = 0.50f;
 
-  // Optional traditional validation.  Disabled by the current launch default.
-  bool use_traditional_validation = false;
-  double validation_timeout_sec = 4.0;
-  double validation_accumulation_sec = 2.0;
-  float validation_roi_radius_m = 0.50f;
 };
 
 struct ScoreSample {
@@ -215,10 +205,6 @@ class TargetManager {
     colored_cloud_pub_ =
         nh_.advertise<sensor_msgs::PointCloud2>(
             cfg_.colored_cloud_topic, 4, true);
-    validation_request_pub_ =
-        nh_.advertise<livox_reflective_marker::CandidateValidationRequest>(
-            cfg_.validation_request_topic, 4, true);
-
     bpu_scores_sub_ = nh_.subscribe<livox_reflective_marker::BpuScores>(
         cfg_.bpu_scores_topic, 4, &TargetManager::BpuScoresCallback, this);
     cluster_cloud_sub_ =
@@ -227,11 +213,6 @@ class TargetManager {
             &TargetManager::ClusterCloudCallback, this);
     ekf_status_sub_ = nh_.subscribe<livox_reflective_marker::EkfStatus>(
         cfg_.ekf_status_topic, 4, &TargetManager::EkfStatusCallback, this);
-    validation_result_sub_ =
-        nh_.subscribe<livox_reflective_marker::CandidateValidationResult>(
-            cfg_.validation_result_topic, 4,
-            &TargetManager::ValidationResultCallback, this);
-
     state_enter_time_ = ros::Time::now();
     PublishRecognitionConfig();
 
@@ -251,13 +232,11 @@ class TargetManager {
 #define LOAD(name, var) pnh_.param(name, var, var)
     LOAD("bpu_scores_topic", cfg_.bpu_scores_topic);
     LOAD("cluster_cloud_topic", cfg_.cluster_cloud_topic);
-    LOAD("validation_result_topic", cfg_.validation_result_topic);
     LOAD("ekf_status_topic", cfg_.ekf_status_topic);
     LOAD("target_command_topic", cfg_.target_command_topic);
     LOAD("tracking_lost_topic", cfg_.tracking_lost_topic);
     LOAD("recognition_command_topic", cfg_.recognition_command_topic);
     LOAD("colored_cloud_topic", cfg_.colored_cloud_topic);
-    LOAD("validation_request_topic", cfg_.validation_request_topic);
     LOAD("frame_id", cfg_.frame_id);
 
     // Compatibility with existing launch parameter names.
@@ -270,10 +249,6 @@ class TargetManager {
     LOAD("init_score_margin", cfg_.init_margin_threshold);
     LOAD("target_cluster_match_distance_m",
          cfg_.target_cluster_match_distance_m);
-    LOAD("use_traditional_validation", cfg_.use_traditional_validation);
-    LOAD("validation_timeout_sec", cfg_.validation_timeout_sec);
-    LOAD("validation_accumulation_sec", cfg_.validation_accumulation_sec);
-    LOAD("validation_roi_radius_m", cfg_.validation_roi_radius_m);
     LOAD("max_tracks", cfg_.max_tracks);
 
     // New explicit state-machine parameters.
@@ -282,6 +257,8 @@ class TargetManager {
     LOAD("init_required_frames", cfg_.init_required_frames);
     LOAD("init_score_threshold", cfg_.init_score_threshold);
     LOAD("init_margin_threshold", cfg_.init_margin_threshold);
+    LOAD("single_candidate_virtual_second_score",
+         cfg_.single_candidate_virtual_second_score);
     LOAD("audit_interval_sec", cfg_.audit_interval_sec);
     LOAD("audit_required_frames", cfg_.audit_required_frames);
     LOAD("audit_fail_windows", cfg_.audit_fail_windows);
@@ -339,27 +316,188 @@ class TargetManager {
     last_window_id_ = scores->window_id;
 
     UpdateTracks(scores->entries, scores->window_id, now);
-    CheckValidationTimeout(now);
+    LogScoreWindowSummary(*scores);
+    switch (state_) {
+      case DecisionState::kSearching:
+        HandleSearching(now);
+        break;
+      case DecisionState::kRecognized:
+        HandleRecognized(now);
+        break;
+      case DecisionState::kConfirming:
+        HandleConfirming(now);
+        break;
+    }
 
-    if (!validation_pending_) {
-      switch (state_) {
-        case DecisionState::kSearching:
-          HandleSearching(now);
-          break;
-        case DecisionState::kRecognized:
-          HandleRecognized(now);
-          break;
-        case DecisionState::kConfirming:
-          HandleConfirming(now);
-          break;
-      }
+    if (state_ == DecisionState::kRecognized) {
+      PublishActiveCorrectionIfFresh(now);
+    }
+    LogDecisionDebug(now);
 
-      if (!validation_pending_ && state_ == DecisionState::kRecognized) {
-        PublishActiveCorrectionIfFresh(now);
+    PublishColoredCloud();
+  }
+
+  void LogScoreWindowSummary(
+      const livox_reflective_marker::BpuScores& scores) const {
+    int top1 = -1, top2 = -1, top3 = -1;
+    for (size_t i = 0; i < scores.entries.size(); ++i) {
+      if (top1 < 0 || scores.entries[i].score > scores.entries[top1].score) {
+        top3 = top2;
+        top2 = top1;
+        top1 = static_cast<int>(i);
+      } else if (top2 < 0 ||
+                 scores.entries[i].score > scores.entries[top2].score) {
+        top3 = top2;
+        top2 = static_cast<int>(i);
+      } else if (top3 < 0 ||
+                 scores.entries[i].score > scores.entries[top3].score) {
+        top3 = static_cast<int>(i);
       }
     }
 
-    PublishColoredCloud();
+    const auto get_score = [&](int idx) {
+      return idx >= 0 ? scores.entries[idx].score : -1.0f;
+    };
+    const float s1 = get_score(top1);
+    const float s2 = get_score(top2);
+    const float s3 = get_score(top3);
+    const float margin = top1 >= 0
+                             ? s1 - (top2 >= 0 ? s2
+                                                : cfg_.single_candidate_virtual_second_score)
+                             : 0.0f;
+    geometry_msgs::Point c;
+    if (top1 >= 0) c = scores.entries[top1].center;
+
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[target_mgr] score_window window=%u entries=%zu tracks=%zu state=%s "
+        "top1_entry=%d score=%.4f margin=%.4f center=[%.2f,%.2f,%.2f] "
+        "top2_entry=%d score=%.4f top3_entry=%d score=%.4f",
+        scores.window_id, scores.entries.size(), tracks_.size(),
+        StateName(state_), top1, s1, margin, static_cast<double>(c.x),
+        static_cast<double>(c.y), static_cast<double>(c.z), top2, s2, top3,
+        s3);
+  }
+
+  const Track* BestObservedTrack() const {
+    const Track* best = nullptr;
+    for (const auto& track : tracks_) {
+      if (!track.observed_this_window) continue;
+      if (best == nullptr || track.score > best->score ||
+          (track.score == best->score &&
+           track.margin_to_best_other > best->margin_to_best_other)) {
+        best = &track;
+      }
+    }
+    return best;
+  }
+
+  void LogDecisionDebug(const ros::Time& now) const {
+    switch (state_) {
+      case DecisionState::kSearching:
+        LogSearchingDebug(now);
+        break;
+      case DecisionState::kRecognized:
+        LogRecognizedDebug(now);
+        break;
+      case DecisionState::kConfirming:
+        LogConfirmingDebug(now);
+        break;
+    }
+  }
+
+  void LogSearchingDebug(const ros::Time& now) const {
+    const Track* best = BestObservedTrack();
+    if (best == nullptr) {
+      ROS_INFO_THROTTLE(
+          1.0,
+          "[target_mgr] search_debug window=%u tracks=%zu observed=0 "
+          "reason=no_observed_track need_frames=%d score>%.3f margin>=%.3f",
+          last_window_id_, tracks_.size(), cfg_.init_required_frames,
+          static_cast<double>(cfg_.init_score_threshold),
+          static_cast<double>(cfg_.init_margin_threshold));
+      return;
+    }
+
+    const CandidateStats stats = LastStats(*best, cfg_.init_required_frames);
+    const bool frames_ok = stats.valid;
+    const bool best_ok =
+        stats.valid && stats.best_count == cfg_.init_required_frames;
+    const bool score_ok =
+        stats.valid && stats.avg_score > cfg_.init_score_threshold;
+    const bool margin_ok =
+        stats.valid && stats.avg_margin >= cfg_.init_margin_threshold;
+
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[target_mgr] search_debug window=%u tracks=%zu best_track=%d "
+        "cur_score=%.4f cur_margin=%.4f observed_run=%d best_run=%d "
+        "samples=%zu last_seen_age=%.2fs stats_valid=%d stats_count=%d/%d "
+        "stats_best=%d/%d avg_score=%.4f need_score>%.3f avg_margin=%.4f "
+        "need_margin>=%.3f blockers=%s%s%s%s center=[%.2f,%.2f,%.2f]",
+        last_window_id_, tracks_.size(), best->id,
+        static_cast<double>(best->score),
+        static_cast<double>(best->margin_to_best_other), best->observed_run,
+        best->best_run, best->samples.size(),
+        static_cast<double>((now - best->last_seen).toSec()), stats.valid ? 1 : 0,
+        stats.sample_count, cfg_.init_required_frames, stats.best_count,
+        cfg_.init_required_frames, static_cast<double>(stats.avg_score),
+        static_cast<double>(cfg_.init_score_threshold),
+        static_cast<double>(stats.avg_margin),
+        static_cast<double>(cfg_.init_margin_threshold),
+        frames_ok ? "" : "frames ",
+        best_ok ? "" : "best_count ",
+        score_ok ? "" : "score ",
+        margin_ok ? "" : "margin ",
+        static_cast<double>(best->center.x()),
+        static_cast<double>(best->center.y()),
+        static_cast<double>(best->center.z()));
+  }
+
+  void LogRecognizedDebug(const ros::Time& now) const {
+    const Track* active = nullptr;
+    for (const auto& track : tracks_) {
+      if (track.id == active_track_id_) {
+        active = &track;
+        break;
+      }
+    }
+    if (active == nullptr) {
+      ROS_INFO_THROTTLE(
+          1.0,
+          "[target_mgr] recognized_debug window=%u active=%d missing tracks=%zu "
+          "next_audit_in=%.2fs",
+          last_window_id_, active_track_id_, tracks_.size(),
+          static_cast<double>((next_audit_time_ - now).toSec()));
+      return;
+    }
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[target_mgr] recognized_debug window=%u active=%d observed=%d "
+        "cur_score=%.4f cur_margin=%.4f observed_run=%d best_run=%d "
+        "next_audit_in=%.2fs center=[%.2f,%.2f,%.2f]",
+        last_window_id_, active->id, active->observed_this_window ? 1 : 0,
+        static_cast<double>(active->score),
+        static_cast<double>(active->margin_to_best_other), active->observed_run,
+        active->best_run, static_cast<double>((next_audit_time_ - now).toSec()),
+        static_cast<double>(active->center.x()),
+        static_cast<double>(active->center.y()),
+        static_cast<double>(active->center.z()));
+  }
+
+  void LogConfirmingDebug(const ros::Time& now) const {
+    const Track* best = BestObservedTrack();
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[target_mgr] confirming_debug window=%u active=%d tracks=%zu "
+        "current_bad_run=%d/%d confirm_elapsed=%.2fs/%.2fs best_observed=%d "
+        "best_score=%.4f best_margin=%.4f",
+        last_window_id_, active_track_id_, tracks_.size(), current_bad_run_,
+        cfg_.current_bad_frames,
+        static_cast<double>((now - confirm_start_time_).toSec()),
+        static_cast<double>(cfg_.confirm_timeout_sec), best ? best->id : -1,
+        static_cast<double>(best ? best->score : -1.0f),
+        static_cast<double>(best ? best->margin_to_best_other : 0.0f));
   }
 
   void UpdateTracks(
@@ -412,7 +550,8 @@ class TargetManager {
     const size_t best_idx = order.front();
     const float best_score = entries[best_idx].score;
     const float second_score =
-        order.size() > 1 ? entries[order[1]].score : 0.0f;
+        order.size() > 1 ? entries[order[1]].score
+                         : cfg_.single_candidate_virtual_second_score;
 
     for (size_t i = 0; i < entries.size(); ++i) {
       meta[i].center = ToEigen(entries[i].center);
@@ -584,7 +723,7 @@ class TargetManager {
     if (out_stats != nullptr) *out_stats = stats;
     return stats.valid &&
            stats.best_count == required_frames &&
-           stats.avg_score >= score_threshold &&
+           stats.avg_score > score_threshold &&
            stats.avg_margin >= margin_threshold;
   }
 
@@ -740,7 +879,7 @@ class TargetManager {
   void UpdateCurrentBadRun(const Track* active) {
     bool bad = true;
     if (active && active->observed_this_window) {
-      bad = active->score < cfg_.current_bad_score_threshold ||
+      bad = active->score <= cfg_.current_bad_score_threshold ||
             active->margin_to_best_other <=
                 -cfg_.current_bad_margin_threshold;
     }
@@ -760,7 +899,7 @@ class TargetManager {
   void PublishActiveCorrectionIfFresh(const ros::Time& stamp) {
     Track* active = FindTrackById(active_track_id_);
     if (!active || !active->observed_this_window) return;
-    if (active->score < cfg_.active_correction_score_threshold) return;
+    if (active->score <= cfg_.active_correction_score_threshold) return;
     if (active->margin_to_best_other <
         cfg_.active_correction_margin_threshold) {
       return;
@@ -778,12 +917,6 @@ class TargetManager {
   void IssueTarget(Track* track, uint8_t action, const ros::Time& stamp,
                    const std::string& source) {
     if (track == nullptr) return;
-
-    if (cfg_.use_traditional_validation) {
-      RequestValidation(*track, action, stamp, source);
-      return;
-    }
-
     PublishCommand(*track, action, stamp, source);
     EnterRecognized(track->id, track->center, stamp, source);
   }
@@ -830,110 +963,6 @@ class TargetManager {
     }
   }
 
-  void RequestValidation(const Track& track, uint8_t action,
-                         const ros::Time& stamp,
-                         const std::string& source) {
-    validation_pending_ = true;
-    pending_proposal_id_ = ++next_proposal_id_;
-    pending_track_id_ = track.id;
-    pending_action_ = action;
-    pending_source_ = source;
-    validation_request_time_ = stamp.isZero() ? ros::Time::now() : stamp;
-
-    livox_reflective_marker::CandidateValidationRequest req;
-    req.header.stamp = validation_request_time_;
-    req.header.frame_id = cfg_.frame_id;
-    req.proposal_id = pending_proposal_id_;
-    req.mode = action;
-    req.center = ToPoint(track.center);
-    req.roi_radius = cfg_.validation_roi_radius_m;
-    req.accumulation_sec =
-        static_cast<float>(cfg_.validation_accumulation_sec);
-    req.seed_cloud = sensor_msgs::PointCloud2{};
-    req.seed_cloud.header = req.header;
-    validation_request_pub_.publish(req);
-
-    ROS_INFO("[target_mgr] validation requested source=%s action=%s "
-             "proposal=%u track=%d",
-             source.c_str(), CommandName(action),
-             pending_proposal_id_, track.id);
-  }
-
-  void CheckValidationTimeout(const ros::Time& now) {
-    if (!validation_pending_) return;
-    if ((now - validation_request_time_).toSec() <=
-        cfg_.validation_timeout_sec) {
-      return;
-    }
-
-    ROS_WARN("[target_mgr] validation timeout proposal=%u source=%s",
-             pending_proposal_id_, pending_source_.c_str());
-    ClearValidation();
-    if (state_ == DecisionState::kSearching) {
-      EnterSearching(now, "VALIDATION_TIMEOUT");
-    } else {
-      EnterConfirming(now, "VALIDATION_TIMEOUT");
-    }
-  }
-
-  void ValidationResultCallback(
-      const livox_reflective_marker::CandidateValidationResult::ConstPtr&
-          result) {
-    if (!validation_pending_ || result->proposal_id != pending_proposal_id_) {
-      return;
-    }
-
-    const uint8_t action = pending_action_;
-    const int track_id = pending_track_id_;
-    const std::string source = pending_source_;
-    ClearValidation();
-
-    if (!result->accepted) {
-      ROS_WARN("[target_mgr] validation rejected source=%s reason=%s",
-               source.c_str(), result->reason.c_str());
-      if (action == kCommandInit) {
-        EnterSearching(result->header.stamp, "VALIDATION_REJECTED");
-      } else {
-        EnterConfirming(result->header.stamp, "VALIDATION_REJECTED");
-      }
-      return;
-    }
-
-    livox_reflective_marker::TargetCommand cmd;
-    cmd.header = result->header;
-    cmd.action = action;
-    cmd.pose = result->pose;
-    cmd.init_cloud = result->roi_cloud;
-    target_cmd_pub_.publish(cmd);
-
-    Eigen::Vector3f center(
-        static_cast<float>(result->pose.pose.position.x),
-        static_cast<float>(result->pose.pose.position.y),
-        static_cast<float>(result->pose.pose.position.z));
-    Track* track = FindTrackById(track_id);
-    if (track) {
-      track->center = center;
-      track->score = result->score;
-      track->margin_to_best_other = result->margin;
-      track->last_seen = result->header.stamp;
-    }
-
-    ROS_WARN("[target_mgr] validation accepted source=%s action=%s "
-             "track=%d score=%.3f",
-             source.c_str(), CommandName(action),
-             track_id, static_cast<double>(result->score));
-    EnterRecognized(track_id, center, result->header.stamp, source);
-  }
-
-  void ClearValidation() {
-    validation_pending_ = false;
-    pending_proposal_id_ = 0;
-    pending_track_id_ = -1;
-    pending_action_ = 0;
-    pending_source_.clear();
-    validation_request_time_ = ros::Time();
-  }
-
   void EkfStatusCallback(
       const livox_reflective_marker::EkfStatus::ConstPtr& status) {
     last_ekf_orientation_ = status->current_pose.pose.orientation;
@@ -956,7 +985,6 @@ class TargetManager {
     active_center_ = Eigen::Vector3f::Zero();
     audit_fail_windows_ = 0;
     current_bad_run_ = 0;
-    ClearValidation();
     SetState(DecisionState::kSearching, stamp, reason);
   }
 
@@ -1126,13 +1154,11 @@ class TargetManager {
   ros::Subscriber bpu_scores_sub_;
   ros::Subscriber cluster_cloud_sub_;
   ros::Subscriber ekf_status_sub_;
-  ros::Subscriber validation_result_sub_;
 
   ros::Publisher target_cmd_pub_;
   ros::Publisher tracking_lost_pub_;
   ros::Publisher recognition_cmd_pub_;
   ros::Publisher colored_cloud_pub_;
-  ros::Publisher validation_request_pub_;
 
   DecisionState state_ = DecisionState::kSearching;
   ros::Time state_enter_time_;
@@ -1154,13 +1180,6 @@ class TargetManager {
 
   livox_reflective_marker::ClusterCloud::ConstPtr latest_cluster_cloud_;
 
-  bool validation_pending_ = false;
-  uint32_t next_proposal_id_ = 0;
-  uint32_t pending_proposal_id_ = 0;
-  int pending_track_id_ = -1;
-  uint8_t pending_action_ = 0;
-  std::string pending_source_;
-  ros::Time validation_request_time_;
 };
 
 }  // namespace

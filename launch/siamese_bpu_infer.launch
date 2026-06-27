@@ -2,14 +2,16 @@
 <launch>
   <arg name="config_file"
        default="$(find livox_reflective_marker)/config/siamese_bpu_infer.yaml"/>
+  <arg name="input_msg_type" default="custom"/>
   <arg name="start_driver" default="true"/>
   <arg name="driver_launch_prefix" default=""/>
   <arg name="driver_output" default="log"/>
   <arg name="start_ekf" default="true"/>
-  <arg name="start_traditional_validator" default="false"/>
   <arg name="rviz" default="true"/>
 
   <rosparam command="load" file="$(arg config_file)"/>
+  <param name="/siamese_bpu_infer_node/input_msg_type"
+         value="$(arg input_msg_type)"/>
 
   <group if="$(arg start_driver)">
     <param name="xfer_format" value="1"/>
@@ -51,17 +53,11 @@
           required="true"/>
   </group>
 
-  <node if="$(arg start_traditional_validator)"
-        name="traditional_validator"
-        pkg="livox_reflective_marker"
-        type="traditional_validator_node"
-        output="screen"/>
-
   <node if="$(arg rviz)"
         name="rviz"
         pkg="rviz"
         type="rviz"
-        args="-d $(find livox_reflective_marker)/config/bpu.rviz">
+        args="-d $(find livox_reflective_marker)/config/rviz/bpu.rviz">
     <env name="DISABLE_ROS1_EOL_WARNINGS" value="1"/>
   </node>
 
@@ -82,15 +78,14 @@
         type="resource_monitor_node"
         output="screen"/>
 
-  <node if="$(arg start_traditional_validator)"
-        name="resource_monitor_traditional_validator"
-        pkg="livox_reflective_marker"
-        type="resource_monitor_node"
-        output="screen"/>
+	  <node if="$(arg start_ekf)"
+	        name="resource_monitor_ekf"
+	        pkg="livox_reflective_marker"
+	        type="resource_monitor_node"
+	        output="screen"/>
 
-  <node if="$(arg start_ekf)"
-        name="resource_monitor_ekf"
-        pkg="livox_reflective_marker"
-        type="resource_monitor_node"
-        output="screen"/>
+	  <node name="resource_monitor_total"
+	        pkg="livox_reflective_marker"
+	        type="resource_monitor_node"
+	        output="screen"/>
 </launch>

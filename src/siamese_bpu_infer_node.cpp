@@ -23,11 +23,17 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -56,6 +62,7 @@ struct Cluster {
 
 struct Config {
   std::string input_topic = "/livox/lidar";
+  std::string input_msg_type = "custom";
   std::string bpu_model_path;
 
   uint8_t reflectivity_threshold = 250;
@@ -63,6 +70,8 @@ struct Config {
 
   float cluster_tolerance_m = 0.25f;
   size_t min_cluster_points = 3, max_cluster_points = 2000;
+  size_t min_inference_cluster_points = 0;
+  size_t inference_fps_target_points = 0;
 
   int max_accumulation_frames = 20;
   double publish_interval_sec = 0.1;
@@ -70,6 +79,21 @@ struct Config {
   std::string frame_id = "livox_frame";
 
   float roi_radius_m = 0.45f;
+
+  bool enable_size_filter = true;
+  bool enable_plane_filter = true;
+  float size_filter_min_long_axis_m = 0.12f;
+  float size_filter_max_long_axis_m = 0.35f;
+  float size_filter_min_short_axis_m = 0.06f;
+  float size_filter_max_short_axis_m = 0.30f;
+  float plane_filter_max_thickness_m = 0.08f;
+
+  bool debug_dump_candidates = false;
+  std::string debug_dump_dir = "/tmp/siamese_bpu_candidate_dump";
+  int debug_dump_top_k = 1;
+  double debug_dump_interval_sec = 1.0;
+
+  float decision_score_threshold = -0.004310191f;
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +109,64 @@ PointXYZI ToPoint(const livox_ros_driver2::CustomPoint& raw) {
   return p;
 }
 
+const sensor_msgs::PointField* FindField(const sensor_msgs::PointCloud2& cloud,
+                                         const std::string& name) {
+  for (const auto& field : cloud.fields) {
+    if (field.name == name) return &field;
+  }
+  return nullptr;
+}
+
+float ReadFloat32(const uint8_t* ptr) {
+  float value = 0.0f;
+  std::memcpy(&value, ptr, sizeof(float));
+  return value;
+}
+
+float ReadFieldAsFloat(const uint8_t* ptr, uint8_t datatype) {
+  switch (datatype) {
+    case sensor_msgs::PointField::INT8:
+      return static_cast<float>(*reinterpret_cast<const int8_t*>(ptr));
+    case sensor_msgs::PointField::UINT8:
+      return static_cast<float>(*reinterpret_cast<const uint8_t*>(ptr));
+    case sensor_msgs::PointField::INT16: {
+      int16_t v = 0;
+      std::memcpy(&v, ptr, sizeof(v));
+      return static_cast<float>(v);
+    }
+    case sensor_msgs::PointField::UINT16: {
+      uint16_t v = 0;
+      std::memcpy(&v, ptr, sizeof(v));
+      return static_cast<float>(v);
+    }
+    case sensor_msgs::PointField::INT32: {
+      int32_t v = 0;
+      std::memcpy(&v, ptr, sizeof(v));
+      return static_cast<float>(v);
+    }
+    case sensor_msgs::PointField::UINT32: {
+      uint32_t v = 0;
+      std::memcpy(&v, ptr, sizeof(v));
+      return static_cast<float>(v);
+    }
+    case sensor_msgs::PointField::FLOAT32:
+      return ReadFloat32(ptr);
+    case sensor_msgs::PointField::FLOAT64: {
+      double v = 0.0;
+      std::memcpy(&v, ptr, sizeof(v));
+      return static_cast<float>(v);
+    }
+    default:
+      return std::numeric_limits<float>::quiet_NaN();
+  }
+}
+
+uint8_t ReflectivityFromFloat(float value) {
+  if (!std::isfinite(value)) return 0;
+  const int rounded = static_cast<int>(std::lround(value));
+  return static_cast<uint8_t>(std::max(0, std::min(255, rounded)));
+}
+
 float SquaredDistance(const PointXYZI& a, const PointXYZI& b) {
   float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
   return dx * dx + dy * dy + dz * dz;
@@ -96,6 +178,108 @@ bool IsHighReflective(const PointXYZI& p, const Config& cfg) {
   return p.reflectivity >= cfg.reflectivity_threshold &&
          d >= cfg.min_distance_m && d <= cfg.max_distance_m &&
          IsFinite(p.x) && IsFinite(p.y) && IsFinite(p.z);
+}
+
+std::array<float, 3> SortedAxisAlignedExtents(
+    const std::vector<Eigen::Vector3f>& points) {
+  std::array<float, 3> extents{0.0f, 0.0f, 0.0f};
+  if (points.empty()) return extents;
+  Eigen::Vector3f min_p = points.front();
+  Eigen::Vector3f max_p = points.front();
+  for (const auto& p : points) {
+    min_p = min_p.cwiseMin(p);
+    max_p = max_p.cwiseMax(p);
+  }
+  const Eigen::Vector3f diff = max_p - min_p;
+  extents = {diff.x(), diff.y(), diff.z()};
+  std::sort(extents.begin(), extents.end(), std::greater<float>());
+  return extents;
+}
+
+std::array<float, 3> EstimatePcaExtents(
+    const std::vector<Eigen::Vector3f>& points) {
+  if (points.size() < 3) return SortedAxisAlignedExtents(points);
+
+  Eigen::Vector3f mean = Eigen::Vector3f::Zero();
+  for (const auto& p : points) mean += p;
+  mean /= static_cast<float>(points.size());
+
+  Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+  for (const auto& p : points) {
+    const Eigen::Vector3f d = p - mean;
+    cov += d * d.transpose();
+  }
+  cov /= static_cast<float>(points.size() - 1);
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+  if (es.info() != Eigen::Success) return SortedAxisAlignedExtents(points);
+
+  Eigen::Matrix3f axes;
+  axes.col(0) = es.eigenvectors().col(2);
+  axes.col(1) = es.eigenvectors().col(1);
+  axes.col(2) = es.eigenvectors().col(0);
+
+  Eigen::Vector3f min_q(std::numeric_limits<float>::max(),
+                        std::numeric_limits<float>::max(),
+                        std::numeric_limits<float>::max());
+  Eigen::Vector3f max_q(-std::numeric_limits<float>::max(),
+                        -std::numeric_limits<float>::max(),
+                        -std::numeric_limits<float>::max());
+  for (const auto& p : points) {
+    const Eigen::Vector3f q = axes.transpose() * (p - mean);
+    min_q = min_q.cwiseMin(q);
+    max_q = max_q.cwiseMax(q);
+  }
+
+  const Eigen::Vector3f diff = max_q - min_q;
+  std::array<float, 3> extents{diff.x(), diff.y(), diff.z()};
+  std::sort(extents.begin(), extents.end(), std::greater<float>());
+  return extents;
+}
+
+bool PassSizeFilter(const Cluster& cluster, const Config& cfg) {
+  if (!cfg.enable_size_filter && !cfg.enable_plane_filter) return true;
+  std::vector<Eigen::Vector3f> pts;
+  pts.reserve(cluster.points.size());
+  for (const auto& p : cluster.points) pts.emplace_back(p.x, p.y, p.z);
+  const auto ext = EstimatePcaExtents(pts);
+  const float long_axis = ext[0];
+  const float short_axis = ext[1];
+  const float thickness = ext[2];
+
+  if (cfg.enable_plane_filter &&
+      thickness > cfg.plane_filter_max_thickness_m) {
+    return false;
+  }
+  if (cfg.enable_size_filter &&
+      (long_axis < cfg.size_filter_min_long_axis_m ||
+       long_axis > cfg.size_filter_max_long_axis_m ||
+       short_axis < cfg.size_filter_min_short_axis_m ||
+       short_axis > cfg.size_filter_max_short_axis_m)) {
+    return false;
+  }
+  return true;
+}
+
+std::vector<Cluster> ApplyCandidateFilter(std::vector<Cluster>&& clusters,
+                                          const Config& cfg,
+                                          size_t* rejected) {
+  if (rejected != nullptr) *rejected = 0;
+  if ((!cfg.enable_size_filter && !cfg.enable_plane_filter) ||
+      clusters.empty()) {
+    return std::move(clusters);
+  }
+
+  std::vector<Cluster> kept;
+  kept.reserve(clusters.size());
+  for (auto& cluster : clusters) {
+    if (PassSizeFilter(cluster, cfg)) {
+      kept.push_back(std::move(cluster));
+    } else if (rejected != nullptr) {
+      ++(*rejected);
+    }
+  }
+  return kept;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +342,79 @@ std::vector<Eigen::Vector3f> ClusterToEigen(const Cluster& cluster) {
   return pts;
 }
 
+std::vector<siamese_bpu::BpuPoint> PointsToBpu(
+    const std::vector<PointXYZI>& points) {
+  std::vector<siamese_bpu::BpuPoint> pts;
+  pts.reserve(points.size());
+  for (const auto& p : points) {
+    siamese_bpu::BpuPoint out;
+    out.xyz = Eigen::Vector3f(p.x, p.y, p.z);
+    out.reflectivity = static_cast<float>(p.reflectivity);
+    pts.push_back(out);
+  }
+  return pts;
+}
+
+float PointDistanceSquared(const PointXYZI& a, const PointXYZI& b) {
+  const float dx = a.x - b.x;
+  const float dy = a.y - b.y;
+  const float dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+std::vector<PointXYZI> FarthestPointSample(
+    const std::vector<PointXYZI>& points, size_t target_count) {
+  if (target_count == 0 || points.size() <= target_count) return points;
+
+  Eigen::Vector3f center = Eigen::Vector3f::Zero();
+  for (const auto& p : points) center += Eigen::Vector3f(p.x, p.y, p.z);
+  center /= static_cast<float>(points.size());
+
+  size_t first = 0;
+  float best_center_d2 = std::numeric_limits<float>::max();
+  for (size_t i = 0; i < points.size(); ++i) {
+    const Eigen::Vector3f d(points[i].x - center.x(),
+                            points[i].y - center.y(),
+                            points[i].z - center.z());
+    const float d2 = d.squaredNorm();
+    if (d2 < best_center_d2) {
+      best_center_d2 = d2;
+      first = i;
+    }
+  }
+
+  std::vector<PointXYZI> sampled;
+  sampled.reserve(target_count);
+  std::vector<float> nearest_d2(points.size(),
+                                std::numeric_limits<float>::max());
+  std::vector<uint8_t> selected(points.size(), 0);
+
+  size_t current = first;
+  for (size_t out = 0; out < target_count; ++out) {
+    sampled.push_back(points[current]);
+    selected[current] = 1;
+
+    size_t next = current;
+    float farthest_d2 = -1.0f;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const float d2 = PointDistanceSquared(points[i], points[current]);
+      nearest_d2[i] = std::min(nearest_d2[i], d2);
+      if (!selected[i] && nearest_d2[i] > farthest_d2) {
+        farthest_d2 = nearest_d2[i];
+        next = i;
+      }
+    }
+    current = next;
+  }
+  return sampled;
+}
+
+std::vector<PointXYZI> InferencePoints(const Cluster& cluster,
+                                       const Config& cfg) {
+  (void)cfg;
+  return cluster.points;
+}
+
 // ---------------------------------------------------------------------------
 // ROS Node — pure BPU scorer
 // ---------------------------------------------------------------------------
@@ -169,19 +426,28 @@ class SiameseBpuInferNode {
     loadConfig();
     initBpu();
     initPublishers();
-    sub_ = nh_.subscribe(cfg_.input_topic, 4,
-                         &SiameseBpuInferNode::pointCloudCallback, this);
+    if (cfg_.input_msg_type == "pointcloud2" ||
+        cfg_.input_msg_type == "sensor_msgs/PointCloud2") {
+      pointcloud2_sub_ = nh_.subscribe(
+          cfg_.input_topic, 4,
+          &SiameseBpuInferNode::pointCloud2Callback, this);
+    } else {
+      sub_ = nh_.subscribe(cfg_.input_topic, 4,
+                           &SiameseBpuInferNode::pointCloudCallback, this);
+    }
     recfg_sub_ = nh_.subscribe(
         "/target_manager/recognition_command", 4,
         &SiameseBpuInferNode::recognitionCommandCallback, this);
-    ROS_INFO("[siamese_bpu] pure scorer ready | model: %s",
-             cfg_.bpu_model_path.c_str());
+    ROS_INFO("[siamese_bpu] pure scorer ready | input_type=%s model: %s",
+             cfg_.input_msg_type.c_str(), cfg_.bpu_model_path.c_str());
   }
 
  private:
   void loadConfig() {
 #define LOAD(ns, name, var) ns.param(name, var, var)
     pnh_.param<std::string>("input_topic", cfg_.input_topic, cfg_.input_topic);
+    pnh_.param<std::string>("input_msg_type", cfg_.input_msg_type,
+                            cfg_.input_msg_type);
     pnh_.param<std::string>("bpu_model_path", cfg_.bpu_model_path, cfg_.bpu_model_path);
 
     int rf = static_cast<int>(cfg_.reflectivity_threshold);
@@ -194,16 +460,45 @@ class SiameseBpuInferNode {
 
     int mn = static_cast<int>(cfg_.min_cluster_points);
     int mx = static_cast<int>(cfg_.max_cluster_points);
+    int min_infer = static_cast<int>(cfg_.min_inference_cluster_points);
+    int fps_target = static_cast<int>(cfg_.inference_fps_target_points);
     pnh_.param("min_cluster_points", mn, mn);
     pnh_.param("max_cluster_points", mx, mx);
+    pnh_.param("min_inference_cluster_points", min_infer, min_infer);
+    pnh_.param("inference_fps_target_points", fps_target, fps_target);
     cfg_.min_cluster_points = static_cast<size_t>(mn);
     cfg_.max_cluster_points = static_cast<size_t>(mx);
+    cfg_.min_inference_cluster_points =
+        static_cast<size_t>(std::max(0, min_infer));
+    cfg_.inference_fps_target_points =
+        static_cast<size_t>(std::max(0, fps_target));
 
     LOAD(pnh_, "max_accumulation_frames", cfg_.max_accumulation_frames);
     LOAD(pnh_, "publish_interval_sec", cfg_.publish_interval_sec);
     LOAD(pnh_, "publish_markers", cfg_.publish_markers);
     LOAD(pnh_, "roi_radius_m", cfg_.roi_radius_m);
+    LOAD(pnh_, "enable_size_filter", cfg_.enable_size_filter);
+    LOAD(pnh_, "enable_plane_filter", cfg_.enable_plane_filter);
+    LOAD(pnh_, "size_filter_min_long_axis_m",
+         cfg_.size_filter_min_long_axis_m);
+    LOAD(pnh_, "size_filter_max_long_axis_m",
+         cfg_.size_filter_max_long_axis_m);
+    LOAD(pnh_, "size_filter_min_short_axis_m",
+         cfg_.size_filter_min_short_axis_m);
+    LOAD(pnh_, "size_filter_max_short_axis_m",
+         cfg_.size_filter_max_short_axis_m);
+    LOAD(pnh_, "plane_filter_max_thickness_m",
+         cfg_.plane_filter_max_thickness_m);
+    LOAD(pnh_, "debug_dump_candidates", cfg_.debug_dump_candidates);
+    LOAD(pnh_, "decision_score_threshold", cfg_.decision_score_threshold);
+    pnh_.param<std::string>("debug_dump_dir", cfg_.debug_dump_dir,
+                            cfg_.debug_dump_dir);
+    LOAD(pnh_, "debug_dump_top_k", cfg_.debug_dump_top_k);
+    LOAD(pnh_, "debug_dump_interval_sec", cfg_.debug_dump_interval_sec);
     pnh_.param<std::string>("frame_id", cfg_.frame_id, cfg_.frame_id);
+
+    cfg_.debug_dump_top_k = std::max(1, cfg_.debug_dump_top_k);
+    cfg_.debug_dump_interval_sec = std::max(0.0, cfg_.debug_dump_interval_sec);
 
     if (cfg_.bpu_model_path.empty()) {
       ROS_ERROR("[siamese_bpu] bpu_model_path is required!");
@@ -245,13 +540,56 @@ class SiameseBpuInferNode {
   // ---- Main callback ---------------------------------------------------
 
   void pointCloudCallback(const livox_ros_driver2::CustomMsg::ConstPtr& msg) {
-    ros::Time now = msg->header.stamp;
+    std::vector<PointXYZI> points;
+    points.reserve(msg->points.size());
+    for (const auto& raw : msg->points) {
+      points.push_back(ToPoint(raw));
+    }
+    processFrame(msg->header.stamp, points);
+  }
 
+  void pointCloud2Callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+    if (msg->is_bigendian) {
+      ROS_WARN_THROTTLE(2.0, "[siamese_bpu] big-endian PointCloud2 is not supported");
+      return;
+    }
+
+    const sensor_msgs::PointField* x_field = FindField(*msg, "x");
+    const sensor_msgs::PointField* y_field = FindField(*msg, "y");
+    const sensor_msgs::PointField* z_field = FindField(*msg, "z");
+    const sensor_msgs::PointField* i_field = FindField(*msg, "reflectivity");
+    if (!i_field) i_field = FindField(*msg, "intensity");
+    if (!x_field || !y_field || !z_field || !i_field) {
+      ROS_WARN_THROTTLE(2.0,
+                        "[siamese_bpu] PointCloud2 missing x/y/z/intensity fields");
+      return;
+    }
+
+    std::vector<PointXYZI> points;
+    points.reserve(static_cast<size_t>(msg->width) * msg->height);
+    for (uint32_t row = 0; row < msg->height; ++row) {
+      const size_t row_base = static_cast<size_t>(row) * msg->row_step;
+      for (uint32_t col = 0; col < msg->width; ++col) {
+        const uint8_t* ptr =
+            msg->data.data() + row_base + static_cast<size_t>(col) * msg->point_step;
+        PointXYZI p;
+        p.x = ReadFieldAsFloat(ptr + x_field->offset, x_field->datatype);
+        p.y = ReadFieldAsFloat(ptr + y_field->offset, y_field->datatype);
+        p.z = ReadFieldAsFloat(ptr + z_field->offset, z_field->datatype);
+        p.reflectivity = ReflectivityFromFloat(
+            ReadFieldAsFloat(ptr + i_field->offset, i_field->datatype));
+        points.push_back(p);
+      }
+    }
+    processFrame(msg->header.stamp, points);
+  }
+
+  void processFrame(const ros::Time& now,
+                    const std::vector<PointXYZI>& raw_points) {
     // 1. Extract high-reflectivity points
     std::vector<PointXYZI> high_pts;
-    high_pts.reserve(msg->points.size());
-    for (const auto& raw : msg->points) {
-      PointXYZI p = ToPoint(raw);
+    high_pts.reserve(raw_points.size());
+    for (const auto& p : raw_points) {
       if (IsHighReflective(p, cfg_)) high_pts.push_back(p);
     }
 
@@ -279,20 +617,61 @@ class SiameseBpuInferNode {
 
     // 5. Cluster accumulated points & BPU score
     std::vector<Cluster> clusters;
+    size_t raw_cluster_count = 0;
+    size_t rejected_by_filter = 0;
     if (!accumulated.empty()) {
       clusters = EuclideanCluster(accumulated, cfg_);
+      raw_cluster_count = clusters.size();
+      clusters = ApplyCandidateFilter(std::move(clusters), cfg_,
+                                      &rejected_by_filter);
+      if (cfg_.min_inference_cluster_points > 0) {
+        const size_t before = clusters.size();
+        clusters.erase(
+            std::remove_if(
+                clusters.begin(), clusters.end(),
+                [&](const Cluster& c) {
+                  return c.size() < cfg_.min_inference_cluster_points;
+                }),
+            clusters.end());
+        rejected_by_filter += before - clusters.size();
+      }
+      if ((cfg_.enable_size_filter || cfg_.enable_plane_filter) &&
+          rejected_by_filter > 0) {
+        ROS_INFO_THROTTLE(
+            1.0,
+            "[siamese_bpu] candidate_filter accumulated raw=%zu kept=%zu rejected=%zu",
+            raw_cluster_count, clusters.size(), rejected_by_filter);
+      }
       for (auto& c : clusters) {
-        auto eigen_pts = ClusterToEigen(c);
-        preproc_.normalize(eigen_pts);
-        preproc_.fixedSize(eigen_pts);
-        c.score = model_.infer(preproc_.candidateNchw(), preproc_.validRatio());
+        const std::vector<PointXYZI> inference_points =
+            InferencePoints(c, cfg_);
+        auto bpu_pts = PointsToBpu(inference_points);
+        preproc_.prepare(bpu_pts,
+                         static_cast<float>(cfg_.reflectivity_threshold));
+        c.score = model_.infer(preproc_.candidatePoint(),
+                               preproc_.candidateMask(),
+                               preproc_.candidateMeta(),
+                               preproc_.candidateCountScale());
       }
     }
+    dumpDebugCandidates(clusters, now);
 
     // 6. Cluster the latest frame once; reuse for centre refresh AND cluster-level coloring.
     std::vector<Cluster> latest_clusters;
+    size_t raw_latest_count = 0;
+    size_t latest_rejected_by_filter = 0;
     if (!frame_buffer_.empty() && !frame_buffer_.back().empty()) {
       latest_clusters = EuclideanCluster(frame_buffer_.back(), cfg_);
+      raw_latest_count = latest_clusters.size();
+      latest_clusters = ApplyCandidateFilter(
+          std::move(latest_clusters), cfg_, &latest_rejected_by_filter);
+      if ((cfg_.enable_size_filter || cfg_.enable_plane_filter) &&
+          latest_rejected_by_filter > 0) {
+        ROS_INFO_THROTTLE(
+            1.0,
+            "[siamese_bpu] candidate_filter latest raw=%zu kept=%zu rejected=%zu",
+            raw_latest_count, latest_clusters.size(), latest_rejected_by_filter);
+      }
     }
     if (!latest_clusters.empty()) {
       const float match_sq = cfg_.cluster_tolerance_m * cfg_.cluster_tolerance_m;
@@ -325,23 +704,67 @@ class SiameseBpuInferNode {
       scores_msg.entries.push_back(entry);
     }
     bpu_scores_pub_.publish(scores_msg);
+    logWindowSummary(now, raw_points.size(), frame_buffer_.empty()
+                                      ? 0
+                                      : frame_buffer_.back().size(),
+                     accumulated.size(), raw_cluster_count, clusters.size(),
+                     rejected_by_filter, raw_latest_count, latest_clusters.size(),
+                     latest_rejected_by_filter, clusters);
 
     // 8. Markers
     if (cfg_.publish_markers)
       publishMarkers(clusters, now);
 
-    // 9. Publish latest-frame cluster cloud for target_manager's visualisation.
-    if (!latest_clusters.empty() || !frame_buffer_.empty()) {
-      publishClusterCloud(latest_clusters,
-                          frame_buffer_.empty()
-                              ? std::vector<PointXYZI>()
-                              : frame_buffer_.back(),
-                          now);
+    // 9. Publish filtered latest-frame clusters for target_manager's visualisation.
+    publishClusterCloud(latest_clusters, now);
+  }
+
+  void logWindowSummary(ros::Time stamp, size_t raw_points, size_t latest_high,
+                        size_t accumulated_high, size_t raw_clusters,
+                        size_t kept_clusters, size_t rejected_clusters,
+                        size_t raw_latest_clusters, size_t kept_latest_clusters,
+                        size_t rejected_latest_clusters,
+                        const std::vector<Cluster>& clusters) const {
+    int top1 = -1, top2 = -1, top3 = -1;
+    for (size_t i = 0; i < clusters.size(); ++i) {
+      if (top1 < 0 || clusters[i].score > clusters[top1].score) {
+        top3 = top2;
+        top2 = top1;
+        top1 = static_cast<int>(i);
+      } else if (top2 < 0 || clusters[i].score > clusters[top2].score) {
+        top3 = top2;
+        top2 = static_cast<int>(i);
+      } else if (top3 < 0 || clusters[i].score > clusters[top3].score) {
+        top3 = static_cast<int>(i);
+      }
     }
+
+    const float top1_score = top1 >= 0 ? clusters[top1].score : -1.0f;
+    const float top2_score = top2 >= 0 ? clusters[top2].score : -1.0f;
+    const float top3_score = top3 >= 0 ? clusters[top3].score : -1.0f;
+    const float margin =
+        (top1 >= 0 && top2 >= 0) ? (top1_score - top2_score) : 0.0f;
+    const Eigen::Vector3f top1_center =
+        top1 >= 0 ? clusters[top1].center : Eigen::Vector3f::Zero();
+    const size_t top1_points =
+        top1 >= 0 ? clusters[top1].points.size() : static_cast<size_t>(0);
+
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[siamese_bpu] window=%u raw_pts=%zu latest_high=%zu accumulated_high=%zu "
+        "clusters=%zu kept=%zu rejected=%zu latest_clusters=%zu kept=%zu rejected=%zu "
+        "top1_id=%d top1_score=%.4f top1_margin=%.4f top1_pts=%zu "
+        "top1_center=[%.2f,%.2f,%.2f] top2_id=%d top2_score=%.4f top3_id=%d top3_score=%.4f",
+        window_id_, raw_points, latest_high, accumulated_high, raw_clusters,
+        kept_clusters, rejected_clusters, raw_latest_clusters,
+        kept_latest_clusters, rejected_latest_clusters, top1, top1_score,
+        margin, top1_points, static_cast<double>(top1_center.x()),
+        static_cast<double>(top1_center.y()),
+        static_cast<double>(top1_center.z()), top2, top2_score, top3,
+        top3_score);
   }
 
   void publishClusterCloud(const std::vector<Cluster>& latest_clusters,
-                           const std::vector<PointXYZI>& latest_points,
                            ros::Time stamp) {
     if (cluster_cloud_pub_.getNumSubscribers() == 0) return;
 
@@ -350,7 +773,12 @@ class SiameseBpuInferNode {
     msg.header.frame_id = cfg_.frame_id;
     msg.window_id = window_id_;
 
-    // Build a raw xyz PointCloud2 from latest_points
+    size_t filtered_point_count = 0;
+    for (const auto& cluster : latest_clusters) {
+      filtered_point_count += cluster.points.size();
+    }
+
+    // Build a raw xyz PointCloud2 from filtered latest clusters only.
     sensor_msgs::PointCloud2 cloud;
     cloud.header = msg.header;
     cloud.height = 1;
@@ -365,26 +793,23 @@ class SiameseBpuInferNode {
     f.name = "z";  f.offset = 8;  cloud.fields.push_back(f);
 
     cloud.point_step = 12;
-    cloud.width = static_cast<uint32_t>(latest_points.size());
+    cloud.width = static_cast<uint32_t>(filtered_point_count);
     cloud.row_step = cloud.point_step * cloud.width;
     cloud.data.resize(cloud.row_step);
 
     float* buf = reinterpret_cast<float*>(cloud.data.data());
-    for (size_t i = 0; i < latest_points.size(); ++i) {
-      buf[i * 3 + 0] = latest_points[i].x;
-      buf[i * 3 + 1] = latest_points[i].y;
-      buf[i * 3 + 2] = latest_points[i].z;
-    }
-    msg.cloud = cloud;
-
-    // per_point_cluster_id: -1 = orphan, 0..N-1 = valid cluster
-    msg.per_point_cluster_id.resize(latest_points.size(), -1);
+    msg.per_point_cluster_id.reserve(filtered_point_count);
+    size_t out_i = 0;
     for (size_t ci = 0; ci < latest_clusters.size(); ++ci) {
-      for (size_t idx : latest_clusters[ci].indices) {
-        if (idx < msg.per_point_cluster_id.size())
-          msg.per_point_cluster_id[idx] = static_cast<int32_t>(ci);
+      for (const auto& p : latest_clusters[ci].points) {
+        buf[out_i * 3 + 0] = p.x;
+        buf[out_i * 3 + 1] = p.y;
+        buf[out_i * 3 + 2] = p.z;
+        msg.per_point_cluster_id.push_back(static_cast<int32_t>(ci));
+        ++out_i;
       }
     }
+    msg.cloud = cloud;
 
     // cluster_centers
     msg.cluster_centers.resize(latest_clusters.size());
@@ -418,9 +843,9 @@ class SiameseBpuInferNode {
       m.scale.z = 0.18f;
 
       float s = clusters[i].score;
-      if (s >= 0.6f) {
+      if (s > cfg_.decision_score_threshold) {
         m.color.r = 0.2f; m.color.g = 1.0f; m.color.b = 0.3f;
-      } else if (s >= 0.3825f) {
+      } else if (s > cfg_.decision_score_threshold - 0.25f) {
         m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 0.2f;
       } else {
         m.color.r = 1.0f; m.color.g = 0.55f; m.color.b = 0.0f;
@@ -435,6 +860,167 @@ class SiameseBpuInferNode {
     marker_pub_.publish(arr);
   }
 
+  void dumpDebugCandidates(const std::vector<Cluster>& clusters,
+                           const ros::Time& stamp) {
+    if (!cfg_.debug_dump_candidates || clusters.empty()) return;
+    if (!last_debug_dump_time_.isZero() &&
+        (stamp - last_debug_dump_time_).toSec() < cfg_.debug_dump_interval_sec) {
+      return;
+    }
+    last_debug_dump_time_ = stamp;
+
+    std::vector<size_t> order(clusters.size());
+    for (size_t i = 0; i < clusters.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+      return clusters[a].score > clusters[b].score;
+    });
+
+    std::error_code ec;
+    std::filesystem::create_directories(cfg_.debug_dump_dir, ec);
+    if (ec) {
+      ROS_WARN_THROTTLE(2.0, "[siamese_bpu] debug dump mkdir failed: %s",
+                        ec.message().c_str());
+      return;
+    }
+
+    const std::filesystem::path root(cfg_.debug_dump_dir);
+    const std::filesystem::path summary_path = root / "summary.csv";
+    const bool write_header = !std::filesystem::exists(summary_path);
+    std::ofstream summary(summary_path, std::ios::app);
+    if (!summary) {
+      ROS_WARN_THROTTLE(2.0, "[siamese_bpu] debug dump summary open failed");
+      return;
+    }
+    if (write_header) {
+      summary << "seq,stamp,window,candidate,rank,score,raw_points,inference_points,center_x,center_y,center_z,"
+                 "valid_count,valid_ratio,count_scale,dump_dir\n";
+    }
+
+    const int n_dump = std::min<int>(
+        cfg_.debug_dump_top_k, static_cast<int>(order.size()));
+    for (int rank = 0; rank < n_dump; ++rank) {
+      const size_t ci = order[rank];
+      const Cluster& cluster = clusters[ci];
+
+      const std::vector<PointXYZI> inference_points =
+          InferencePoints(cluster, cfg_);
+      std::vector<siamese_bpu::BpuPoint> bpu_pts = PointsToBpu(inference_points);
+      siamese_bpu::BpuPreprocessor local_preproc;
+      local_preproc.prepare(bpu_pts,
+                            static_cast<float>(cfg_.reflectivity_threshold));
+
+      std::ostringstream name;
+      name << "seq_" << std::setw(6) << std::setfill('0') << debug_dump_seq_
+           << "_w" << window_id_ << "_r" << rank << "_c" << ci;
+      const std::filesystem::path dir = root / name.str();
+      std::filesystem::create_directories(dir, ec);
+      if (ec) continue;
+
+      writeRawPointsCsv(dir / "raw_points.csv", cluster);
+      writePointsCsv(dir / "inference_points.csv", inference_points);
+      writeCandidatePointCsv(dir / "candidate_point.csv",
+                             local_preproc.candidatePoint());
+      writeMaskCsv(dir / "candidate_mask.csv",
+                   local_preproc.candidateMask());
+      writeMetaCsv(dir / "candidate_meta.csv",
+                   local_preproc.candidateMeta());
+      writeMetaYaml(dir / "meta.yaml", stamp, ci, rank, cluster,
+                    inference_points.size(),
+                    local_preproc.validCount(),
+                    local_preproc.validRatio(),
+                    local_preproc.candidateCountScale());
+
+      summary << debug_dump_seq_ << "," << std::fixed << std::setprecision(6)
+              << stamp.toSec() << "," << window_id_ << "," << ci << ","
+              << rank << "," << std::setprecision(8) << cluster.score << ","
+              << cluster.points.size() << "," << inference_points.size()
+              << "," << std::setprecision(6)
+              << cluster.center.x() << "," << cluster.center.y() << ","
+              << cluster.center.z() << "," << local_preproc.validCount()
+              << "," << local_preproc.validRatio()
+              << "," << local_preproc.candidateCountScale()
+              << "," << dir.string() << "\n";
+      ++debug_dump_seq_;
+    }
+
+    ROS_INFO_THROTTLE(2.0, "[siamese_bpu] debug dumped %d candidate(s) to %s",
+                      n_dump, cfg_.debug_dump_dir.c_str());
+  }
+
+  static void writeRawPointsCsv(const std::filesystem::path& path,
+                                const Cluster& cluster) {
+    writePointsCsv(path, cluster.points);
+  }
+
+  static void writePointsCsv(const std::filesystem::path& path,
+                             const std::vector<PointXYZI>& points) {
+    std::ofstream out(path);
+    out << "x,y,z,reflectivity\n";
+    out << std::fixed << std::setprecision(8);
+    for (const auto& p : points) {
+      out << p.x << "," << p.y << "," << p.z << ","
+          << static_cast<int>(p.reflectivity) << "\n";
+    }
+  }
+
+  static void writeCandidatePointCsv(const std::filesystem::path& path,
+                                     const float* point) {
+    std::ofstream out(path);
+    out << "idx,x,y,z,rho,reflectivity_abs,reflectivity_rel\n";
+    out << std::fixed << std::setprecision(8);
+    for (int i = 0; i < siamese_bpu::BpuPreprocessor::kNumPoints; ++i) {
+      out << i;
+      for (int c = 0; c < siamese_bpu::BpuPreprocessor::kPointChannels; ++c) {
+        out << "," << point[c * siamese_bpu::BpuPreprocessor::kNumPoints + i];
+      }
+      out << "\n";
+    }
+  }
+
+  static void writeMaskCsv(const std::filesystem::path& path,
+                           const float* mask) {
+    std::ofstream out(path);
+    out << "idx,value\n";
+    out << std::fixed << std::setprecision(8);
+    for (int i = 0; i < siamese_bpu::BpuPreprocessor::kNumPoints; ++i) {
+      out << i << "," << mask[i] << "\n";
+    }
+  }
+
+  static void writeMetaCsv(const std::filesystem::path& path,
+                           const float* meta) {
+    std::ofstream out(path);
+    out << "idx,value\n";
+    out << std::fixed << std::setprecision(8);
+    for (int i = 0; i < siamese_bpu::BpuPreprocessor::kMetaDim; ++i) {
+      out << i << "," << meta[i] << "\n";
+    }
+  }
+
+  static void writeMetaYaml(const std::filesystem::path& path,
+                            const ros::Time& stamp,
+                            size_t candidate_idx,
+                            int rank,
+                            const Cluster& cluster,
+                            size_t inference_points,
+                            size_t valid_count,
+                            float valid_ratio,
+                            float count_scale) {
+    std::ofstream out(path);
+    out << std::fixed << std::setprecision(8);
+    out << "stamp: " << stamp.toSec() << "\n";
+    out << "candidate_index: " << candidate_idx << "\n";
+    out << "rank: " << rank << "\n";
+    out << "score: " << cluster.score << "\n";
+    out << "raw_points: " << cluster.points.size() << "\n";
+    out << "inference_points: " << inference_points << "\n";
+    out << "valid_count: " << valid_count << "\n";
+    out << "valid_ratio: " << valid_ratio << "\n";
+    out << "count_scale: " << count_scale << "\n";
+    out << "center: [" << cluster.center.x() << ", " << cluster.center.y()
+        << ", " << cluster.center.z() << "]\n";
+  }
+
   // ---- Members ----
   ros::NodeHandle nh_, pnh_;
   Config cfg_;
@@ -442,14 +1028,17 @@ class SiameseBpuInferNode {
   siamese_bpu::BpuPreprocessor preproc_;
 
   ros::Subscriber sub_;
+  ros::Subscriber pointcloud2_sub_;
   ros::Subscriber recfg_sub_;
   ros::Publisher bpu_scores_pub_;
   ros::Publisher marker_pub_;
   ros::Publisher cluster_cloud_pub_;
 
   ros::Time last_publish_time_;
+  ros::Time last_debug_dump_time_;
   std::deque<std::vector<PointXYZI>> frame_buffer_;
   uint32_t window_id_ = 0;
+  uint64_t debug_dump_seq_ = 0;
 };
 
 }  // namespace
