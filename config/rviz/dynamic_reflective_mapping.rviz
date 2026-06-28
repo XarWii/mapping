@@ -1,15 +1,16 @@
 Panels:
   - Class: rviz/Displays
-    Help Height: 70
+    Help Height: 85
     Name: Displays
     Property Tree Widget:
       Expanded:
         - /Rolling Reflective Map1
+        - /All High-Ref History1
         - /Reflective Candidates1
         - /Axes1
         - /Odometry1
       Splitter Ratio: 0.5
-    Tree Height: 454
+    Tree Height: 1121
   - Class: rviz/Views
     Expanded:
       - /Current View1
@@ -26,7 +27,7 @@ Visualization Manager:
       Cell Size: 1
       Class: rviz/Grid
       Color: 160; 160; 164
-      Enabled: false
+      Enabled: true
       Line Style:
         Line Width: 0.029999999329447746
         Value: Lines
@@ -39,12 +40,40 @@ Visualization Manager:
       Plane: XY
       Plane Cell Count: 20
       Reference Frame: <Fixed Frame>
-      Value: false
+      Value: true
     - Alpha: 1
-      Autocompute Intensity Bounds: true
+      Autocompute Intensity Bounds: false
+      Autocompute Value Bounds:
+        Max Value: 8
+        Min Value: 1
+        Value: true
+      Axis: Z
+      Channel Name: evidence
+      Class: rviz/PointCloud2
+      Color: 0; 220; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: Rolling Reflective Map
+      Position Transformer: XYZ
+      Queue Size: 1
+      Selectable: true
+      Size (Pixels): 5
+      Size (m): 0.03500000014901161
+      Style: Spheres
+      Topic: /reflective/rolling_map
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 0.75
+      Autocompute Intensity Bounds: false
       Autocompute Value Bounds:
         Max Value: 255
-        Min Value: 0
+        Min Value: 170
         Value: true
       Axis: Z
       Channel Name: intensity
@@ -55,15 +84,15 @@ Visualization Manager:
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Min Color: 0; 0; 0
-      Name: Rolling Reflective Map
+      Min Color: 32; 32; 32
+      Name: All High-Ref History
       Position Transformer: XYZ
       Queue Size: 1
       Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.009999999776482582
-      Style: Squares
-      Topic: /reflective/rolling_map
+      Size (Pixels): 4
+      Size (m): 0.018000000156462193
+      Style: Spheres
+      Topic: /reflective/all_high_ref_history
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
@@ -192,8 +221,8 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Default Light: true
-    Fixed Frame: reflective_odom
-    Frame Rate: 5
+    Fixed Frame: world
+    Frame Rate: 30
   Name: root
   Tools:
     - Class: rviz/Interact
@@ -206,7 +235,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 10.198039054870605
+      Distance: 5.199758529663086
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -214,27 +243,27 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -1.099020004272461
-        Y: -1.09902024269104
-        Z: 1.274179458618164
+        X: 0.37448355555534363
+        Y: -2.4969823360443115
+        Z: 3.114278793334961
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.7853981256484985
-      Target Frame: world
-      Yaw: 0.7853981852531433
+      Pitch: 0.2700004279613495
+      Target Frame: <Fixed Frame>
+      Yaw: 1.7950080633163452
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 669
+  Height: 1369
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000002000000000000015600000247fc0200000001fb000000100044006900730070006c006100790073010000003b00000247000000c700ffffff000000010000010000000247fc0200000001fb0000000a00560069006500770073010000003b00000247000000a000ffffff0000029e0000024700000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd000000010000000000000171000004f7fc0200000002fb000000100044006900730070006c0061007900730100000044000004f7000000eb00fffffffb0000000a0056006900650077007300000001ee00000114000000b900ffffff00000842000004f700000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1280
-  X: 0
-  Y: 27
+  Width: 2490
+  X: 70
+  Y: 34

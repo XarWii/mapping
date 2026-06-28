@@ -4,9 +4,9 @@
        default="$(find livox_reflective_marker)/config/dynamic_reflective_mapping.yaml"/>
   <arg name="start_intensity_filter" default="false"/>
   <arg name="start_candidate_extractor" default="true"/>
-  <arg name="start_bpu_scorer" default="true"/>
+  <arg name="start_bpu_scorer" default="false"/>
   <arg name="use_observation_bpu_scorer" default="true"/>
-  <arg name="start_map_decision" default="true"/>
+  <arg name="start_map_decision" default="false"/>
   <arg name="start_pose_estimator" default="true"/>
   <arg name="rviz" default="true"/>
 

@@ -7,9 +7,9 @@ dynamic_reflective_mapping:
   # converts it once at input and uses m/s^2 exclusively after that boundary.
   imu_acceleration_input_unit: "g"
   pose_topic: "/lio/odom"
-  # /lio/odom is the 10 Hz LiDAR pose. The mapper converts it internally to
-  # the IMU pose contract using T_imu_lidar below.
-  pose_input_frame: "lidar"
+  # Super-LIO publishes the 10 Hz IMU pose; the mapper applies T_imu_lidar only
+  # when transforming LiDAR points into the map frame.
+  pose_input_frame: "imu"
   # Empty means use /lio/odom.header.frame_id, normally the LIO map frame.
   # The first valid pose anchors: external_odom_frame -> reflective_odom.
   external_odom_frame: ""
@@ -32,6 +32,13 @@ dynamic_reflective_mapping:
   # The mapper retains raw scans until the pose with the corresponding sensor
   # timestamp arrives.  Two seconds also covers starting this node after LIO.
   pose_timeout_sec: 2.0
+  # Primary debug path for the next experiment: every accepted high-ref point
+  # queries the local /lio/odom trajectory by its own timestamp.  The legacy
+  # IMU-based mapper remains in the code as an A/B path.
+  trajectory_mode: "odom_poseat"
+  odom_time_offset_sec: 0.0
+  max_odom_bracket_gap_sec: 0.15
+  max_odom_samples: 64
 
   map_frame: "reflective_odom"
   lidar_frame: "livox_frame"
@@ -64,6 +71,25 @@ dynamic_reflective_mapping:
   wheel_bucket_count: 128
   voxel_size_m: 0.003
   merge_distance_m: 0.003
+  # Map Element Measurement Filter.  This is the first real measurement-noise
+  # suppression stage: raw high-ref points are deskewed, aggregated within a
+  # scan and fused into bounded map elements.  Publish all element means for
+  # visual coverage while using evidence coloring to reveal stable support.
+  enable_map_element_filter: true
+  scan_observation_voxel_size_m: 0.015
+  map_element_association_radius_m: 0.03
+  map_element_mature_min_support_scans: 3
+  map_element_mature_max_rms_m: 0.025
+  map_element_weight_cap: 8.0
+  map_element_max_elements: 32768
+  publish_mature_map_only: false
+  # Debug experiment: IMU-derived translation is currently drifting against
+  # /lio/odom by ~0.18 m over one odom interval. Keep rotational deskew but
+  # use the external odom pose as the scan translation anchor.
+  deskew_use_imu_translation: false
+  # Debug experiment: bypass the internal IMU-propagated scan trajectory and
+  # deskew each point with interpolation between adjacent /lio/odom poses.
+  deskew_use_external_pose_interpolation: false
 
   # Gate discontinuous external outputs before they can mix map epochs.
   max_external_velocity_mps: 5.0
@@ -77,8 +103,13 @@ dynamic_reflective_mapping:
   accel_noise_std: 0.2
   gyro_bias_noise_std: 0.0005
   accel_bias_noise_std: 0.005
-  pose_position_std: 0.15
-  pose_rotation_std: 0.08
+  # Debug experiment: trust Super-LIO /lio/odom more strongly while diagnosing
+  # map layering.  Previous values were 0.15 m and 0.08 rad.
+  pose_position_std: 0.02
+  pose_rotation_std: 0.01
+  # Debug experiment: after the soft KF update adjusts velocity/bias, pin the
+  # correction timestamp pose exactly to /lio/odom.
+  hard_pose_anchor: true
   initial_bias_window_sec: 0.5
 
   # Enable while validating. Disable in the final resource measurement run.
@@ -92,6 +123,14 @@ dynamic_reflective_mapping:
   map_snapshot_topic: "/reflective/map_snapshot"
   publish_deskewed_high_ref_cloud: true
   deskewed_high_ref_cloud_topic: "/reflective/deskewed_high_ref_cloud"
+  # Debug view: retain and publish every deskewed high-reflectivity observation
+  # point. Set max_all_high_ref_history_points to 0 for an uncapped history.
+  publish_all_high_ref_history: true
+  all_high_ref_history_topic: "/reflective/all_high_ref_history"
+  max_all_high_ref_history_points: 0
+  save_all_high_ref_history_pcd: true
+  all_high_ref_history_pcd_path: "/workspace/moving/reflective_all_high_history_ge160.pcd"
+  all_high_ref_history_parent_pcd_path: "/workspace/moving/reflective_all_high_history_ge160_world.pcd"
   publish_observation_frame: true
   observation_frame_topic: "/reflective/observation_frame"
   max_observation_points_per_frame: 4096
@@ -127,9 +166,9 @@ reflective_candidate_extractor:
   grid_origin_map: [0.0, 0.0, 0.0]
   mid_cell_size_m: 0.06
   evidence_aggregation_cap: 8
-  mid_active_evidence_threshold: 3
-  mid_active_min_fine_voxels: 3
-  d_bridge_cells: 1
+  mid_active_evidence_threshold: 2
+  mid_active_min_fine_voxels: 1
+  d_bridge_cells: 2
   # AABB ROI = seed support bbox expanded by this map-frame margin.
   roi_completion_margin_m: 0.12
   min_map_support_voxels: 12
@@ -139,6 +178,7 @@ reflective_candidate_extractor:
   keep_time_s: -1
   candidate_association_iou_threshold: 0.20
   roi_dedup_iou_threshold: 0.60
+  roi_dedup_point_overlap_threshold: 0.70
   candidates_topic: "/reflective/candidates"
   candidate_cloud_topic: "/reflective/candidate_cloud"
   markers_topic: "/reflective/candidate_markers"

@@ -128,6 +128,7 @@ struct Stats {
   uint32_t roi_low_evidence = 0;
   uint32_t roi_too_large = 0;
   uint32_t deduped = 0;
+  uint32_t overlap_deduped = 0;
 };
 
 struct Config {
@@ -143,8 +144,8 @@ struct Config {
   float mid_cell_size_m = 0.05f;
   uint16_t evidence_aggregation_cap = 8;
   uint32_t mid_active_evidence_threshold = 2;
-  uint32_t mid_active_min_fine_voxels = 2;
-  int d_bridge_cells = 1;
+  uint32_t mid_active_min_fine_voxels = 1;
+  int d_bridge_cells = 2;
   float roi_completion_margin_m = 0.12f;
   uint32_t min_map_support_voxels = 4;
   uint32_t min_map_support_evidence = 4;
@@ -152,6 +153,7 @@ struct Config {
   double keep_time_s = -1.0;
   float candidate_association_iou_threshold = 0.20f;
   float roi_dedup_iou_threshold = 0.85f;
+  float roi_dedup_point_overlap_threshold = 0.70f;
 
   std::string candidates_topic = "/reflective/candidates";
   std::string candidate_cloud_topic = "/reflective/candidate_cloud";
@@ -172,6 +174,29 @@ float AabbIou(const Eigen::Vector3f& a_min, const Eigen::Vector3f& a_max,
   if (inter <= 0.0f) return 0.0f;
   const float total = AabbVolume(a_min, a_max) + AabbVolume(b_min, b_max) - inter;
   return total > 0.0f ? inter / total : 0.0f;
+}
+
+float SortedIndexOverlapRatio(const std::vector<uint32_t>& a,
+                              const std::vector<uint32_t>& b) {
+  if (a.empty() || b.empty()) return 0.0f;
+  size_t i = 0;
+  size_t j = 0;
+  size_t intersection = 0;
+  while (i < a.size() && j < b.size()) {
+    if (a[i] == b[j]) {
+      ++intersection;
+      ++i;
+      ++j;
+    } else if (a[i] < b[j]) {
+      ++i;
+    } else {
+      ++j;
+    }
+  }
+  const size_t smaller = std::min(a.size(), b.size());
+  return smaller > 0 ? static_cast<float>(intersection) /
+                           static_cast<float>(smaller)
+                     : 0.0f;
 }
 
 VoxelKey QuantizeFloor(const Eigen::Vector3f& point,
@@ -339,6 +364,9 @@ class ReflectiveCandidateExtractor {
                       config.candidate_association_iou_threshold);
     private_nh_.param("roi_dedup_iou_threshold", config.roi_dedup_iou_threshold,
                       config.roi_dedup_iou_threshold);
+    private_nh_.param("roi_dedup_point_overlap_threshold",
+                      config.roi_dedup_point_overlap_threshold,
+                      config.roi_dedup_point_overlap_threshold);
     private_nh_.param("candidates_topic", config.candidates_topic,
                       config.candidates_topic);
     private_nh_.param("candidate_cloud_topic", config.candidate_cloud_topic,
@@ -364,6 +392,8 @@ class ReflectiveCandidateExtractor {
         config_.candidate_association_iou_threshold > 1.0f ||
         config_.roi_dedup_iou_threshold < 0.0f ||
         config_.roi_dedup_iou_threshold > 1.0f ||
+        config_.roi_dedup_point_overlap_threshold < 0.0f ||
+        config_.roi_dedup_point_overlap_threshold > 1.0f ||
         config_.extract_snapshot_period_sec < 0.0) {
       throw std::runtime_error("invalid reflective_candidate_extractor parameters");
     }
@@ -558,6 +588,7 @@ class ReflectiveCandidateExtractor {
     }
     if (!proposal.fine_indices.empty()) {
       proposal.center /= static_cast<float>(proposal.fine_indices.size());
+      std::sort(proposal.fine_indices.begin(), proposal.fine_indices.end());
     }
     return proposal;
   }
@@ -596,6 +627,13 @@ class ReflectiveCandidateExtractor {
                    existing.roi_min, existing.roi_max) >=
             config_.roi_dedup_iou_threshold) {
           duplicate = true;
+          break;
+        }
+        if (SortedIndexOverlapRatio(proposal.fine_indices,
+                                    existing.fine_indices) >=
+            config_.roi_dedup_point_overlap_threshold) {
+          duplicate = true;
+          if (stats) ++stats->overlap_deduped;
           break;
         }
       }
@@ -929,11 +967,13 @@ class ReflectiveCandidateExtractor {
     ROS_INFO_THROTTLE(
         2.0,
         "candidate extractor phase1 refs=%zu mid=%zu inactive_mid=%u seeds=%u "
-        "overflow=%u proposals=%zu dedup=%u small=%u low_ev=%u large=%u "
+        "overflow=%u proposals=%zu dedup=%u overlap_dedup=%u "
+        "small=%u low_ev=%u large=%u "
         "records=%zu coalesced=%u epoch=%u",
         refs.size(), cells.size(), stats.inactive_mid_cells, stats.seed_regions,
         stats.overflow_seed_count, output.candidates.size(), stats.deduped,
-        stats.roi_too_small, stats.roi_low_evidence, stats.roi_too_large,
+        stats.overlap_deduped, stats.roi_too_small, stats.roi_low_evidence,
+        stats.roi_too_large,
         records_.size(), coalesced_snapshot_count_, map_epoch_);
   }
 
